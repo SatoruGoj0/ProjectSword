@@ -426,10 +426,10 @@ struct iokit_test {
 };
 
 static bool test_iokit_service(const char *name, const char *path, uint32_t type) {
-    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+    io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL,
         IOServiceNameMatching(path));
     if (!svc) {
-        svc = IORegistryEntryFromPath(kIOMasterPortDefault, path);
+        svc = IORegistryEntryFromPath(MACH_PORT_NULL, path);
     }
     if (!svc) {
         printf("[IOKit] %s: service not found\n", name);
@@ -463,7 +463,7 @@ static void diagnostic_iokit(void) {
         test_iokit_service(tests[i].name, tests[i].name, tests[i].type);
     }
     // Also try IOServiceOpen on IOSurface by name
-    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+    io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL,
         IOServiceNameMatching("IOSurfaceRoot"));
     if (svc) {
         printf("[IOKit] IOSurfaceRoot service exists\n");
