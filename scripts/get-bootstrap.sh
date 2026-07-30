@@ -19,9 +19,9 @@ curl -L -o "${TEMP_ZST}" "${BOOTSTRAP_URL}"
 
 echo "[*] Decompressing with zstd..."
 if command -v zstd &>/dev/null; then
-    zstd -d "${TEMP_ZST}" -o "${OUTPUT_FILE}"
+    zstd -d "${TEMP_ZST}" -c > "${OUTPUT_FILE}"
 elif command -v zstdmt &>/dev/null; then
-    zstdmt -d "${TEMP_ZST}" -o "${OUTPUT_FILE}"
+    zstdmt -d "${TEMP_ZST}" -c > "${OUTPUT_FILE}"
 else
     echo "[-] zstd not found. Install with: brew install zstd"
     echo "    Or manually decompress: zstd -d ${TEMP_ZST} -o ${OUTPUT_FILE}"
