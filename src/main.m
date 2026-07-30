@@ -64,16 +64,17 @@ uint64_t gOurPmap, gKernelPmap, gKernelBase, gKernelSlide;
 void redirect_stdout(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        int fds[2];
-        if (pipe(fds) == 0) {
-            dup2(fds[1], STDOUT_FILENO);
+        int pfd[2];
+        if (pipe(pfd) == 0) {
+            dup2(pfd[1], STDOUT_FILENO);
             setvbuf(stdout, NULL, _IONBF, 0);
-            fcntl(fds[0], F_SETFL, O_NONBLOCK);
-            dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, fds[0], 0,
+            fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+            int rfd = pfd[0];
+            dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, rfd, 0,
                 dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0));
             dispatch_source_set_event_handler(src, ^{
                 char buf[4096];
-                ssize_t n = read(fds[0], buf, sizeof(buf)-1);
+                ssize_t n = read(rfd, buf, sizeof(buf) - 1);
                 if (n > 0) {
                     buf[n] = 0;
                     log_printf(@"%s", buf);
