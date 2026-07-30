@@ -9,8 +9,7 @@ ios18-research/*.dmg
 ios18-research/kernelcache.release.*
 ios18-research/kernelcache.research.*
 
-# Bootstrap (downloaded separately)
-bootstrap.tar
+# Compressed bootstrap download (we only track the decompressed .tar via LFS)
 bootstrap.tar.xz
 
 # Xcode user state

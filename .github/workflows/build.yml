@@ -18,15 +18,11 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: Install dependencies
-        run: |
-          brew install ldid xz
-
-      - name: Download Procursus bootstrap
-        run: |
-          chmod +x scripts/download-bootstrap.sh
-          ./scripts/download-bootstrap.sh
+        run: brew install ldid
 
       - name: Build ProjectSword
         run: |

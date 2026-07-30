@@ -14,55 +14,67 @@ An iOS 18.2.1 (build 22C161) jailbreak for iPhone 12 (iPhone13,2, A14) using a 5
 
 ```
 ProjectSword/
-├── src/
-│   ├── main.m          # DarkSword exploit + orchestrator + kernel R/W primitives
-│   ├── physrw.c/h      # Physical R/W via DMA (ported from Fugu18)
-│   ├── util.c/h        # PPL bypass, platformize, proc finder
-│   ├── gadgets.c/h     # Runtime kernel gadget scanner
-│   ├── asm.S           # PAC bypass thread handler + PPL assembly
-│   ├── jailbreak.c/h   # Sandbox escape, tcload, bootstrap, Sileo install
-│   ├── shell.c/h       # TCP command shell (iDownload-like, port 1337)
-│   └── offsets.h       # Verified struct offsets for xnu-11215.62.3
-├── .github/workflows/  # CI/CD pipeline (GitHub Actions)
-├── scripts/            # Bootstrap downloader, env setup
-├── Makefile            # Build system
-├── Info.plist          # Bundle configuration
-└── entitlements.plist  # Required IOKit/security entitlements
+├── src/                   # Exploit chain + post-exploitation
+│   ├── main.m             # DarkSword ICMP6 UAF + kernel R/W primitives
+│   ├── physrw.c/h         # Physical R/W via IODMACommand (Fugu18 port)
+│   ├── util.c/h           # PPL bypass, platformize, proc/task finder
+│   ├── gadgets.c/h        # Runtime kernel gadget scanner
+│   ├── asm.S              # PAC bypass thread handler + PPL assembly
+│   ├── jailbreak.c/h      # Sandbox escape, tcload, bootstrap, Sileo
+│   ├── shell.c/h          # TCP command shell (port 1337)
+│   └── offsets.h          # Verified struct offsets for xnu-11215.62.3
+├── .github/workflows/     # CI/CD: GitHub Actions macOS runner
+├── scripts/               # Bootstrap download helper
+├── bootstrap.tar          # Procursus bootstrap (Git LFS; committed by user)
+├── Makefile               # Build system
+├── Info.plist
+└── entitlements.plist     # IOKit + security entitlements
 ```
 
 ## Requirements
 
 - **macOS 14+** with **Xcode 15.4+** (iOS 18.0 SDK)
 - **Homebrew** (for ldid)
-- A jailbroken iDevice or sideloading tool (AltStore, Sideloadly, TrollStore)
+- Sideloading tool (AltStore, Sideloadly, TrollStore) for IPA install
 - Developer-signed embedded.mobileprovision for on-device deployment
 
 ## Build
 
-### Locally
+### 1. Get the bootstrap (optional, for full bootstrap install)
 
 ```bash
 git clone https://github.com/ibrahimatmorphis/ProjectSword.git
 cd ProjectSword
 
-# Install deps
-brew install ldid
+# Option A — download via script
+./scripts/get-bootstrap.sh
 
-# Download Procursus bootstrap (optional, for full bootstrap install)
-./scripts/download-bootstrap.sh
+# Option B — download manually from:
+#   https://github.com/ProcursusTeam/Procursus/releases
+#   (get bootstrap-iphoneos-arm64e-rootless.tar.xz, extract to bootstrap.tar)
 
-# Build IPA
-cd ios18-research/ProjectSword
-make ipa
+# Commit with Git LFS
+git lfs track ios18-research/ProjectSword/bootstrap.tar
+git add ios18-research/ProjectSword/bootstrap.tar .gitattributes
+git commit -m "Add Procursus bootstrap"
+git push
 ```
 
-The IPA will be at `ios18-research/ProjectSword/ProjectSword.ipa`.
+### 2. Build IPA
+
+```bash
+# Local build
+cd ios18-research/ProjectSword
+make ipa
+
+# Output: ios18-research/ProjectSword/ProjectSword.ipa
+```
 
 ### Via CI (GitHub Actions)
 
-Push to any branch — the workflow builds automatically. Download the IPA from the **Actions** tab → workflow run → **Artifacts**.
+Push `bootstrap.tar` to the repo (with Git LFS), then push any branch — the workflow builds automatically. Download the IPA from **Actions** tab → workflow run → **Artifacts**.
 
-To trigger a release build with auto-published IPA:
+Trigger a release build:
 ```bash
 gh workflow run build.yml -f release=true
 ```

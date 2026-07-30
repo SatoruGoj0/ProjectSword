@@ -66,6 +66,7 @@ ipa: $(TARGET)
 	cp $(TARGET) Payload/ProjectSword.app/
 	cp Info.plist Payload/ProjectSword.app/
 	cp entitlements.plist Payload/ProjectSword.app/
+	if [ -f bootstrap.tar ]; then cp bootstrap.tar Payload/ProjectSword.app/; echo "[+] bootstrap.tar bundled in IPA"; fi
 ifneq ($(SIGN),0)
 	ldid -Sentitlements.plist Payload/ProjectSword.app/$(TARGET) 2>/dev/null || echo "[-] ldid not available, IPA will need manual signing"
 endif
