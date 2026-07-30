@@ -1,21 +1,23 @@
 TARGET = ProjectSword
 CC = clang
 
-# CI flag — set CI=1 on GitHub Actions runners (both branches do same thing now)
 SDK_PATH := $(shell xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
 ISYSROOT := -isysroot $(SDK_PATH)
 
-# Lite mode — strip private entitlements for regular developer signing
-#   make LITE=1 ipa   → uses entitlements.lite.plist (installs but won't exploit)
-#   make ipa          → uses entitlements.plist (needs TrollStore)
+# Lite mode strips private entitlements — works with any developer cert
+# Full mode needs TrollStore (platform-application + private entitlements)
 ENTITLEMENTS_FILE = $(if $(LITE),entitlements.lite.plist,entitlements.plist)
 
-CFLAGS = -framework Foundation \
-         -framework UIKit \
-         -framework CoreServices \
-         -framework IOSurface \
-         -framework IOKit \
-         -framework Security \
+# Always link Foundation, UIKit, Security — needed regardless of mode
+LINK_FRAMEWORKS = -framework Foundation -framework UIKit -framework Security -framework CoreServices
+
+# Lite builds avoid IOSurface/IOKit (needs private entitlements)
+# Full builds can use them (TrollStore-only)
+ifneq ($(LITE),1)
+LINK_FRAMEWORKS += -framework IOSurface -framework IOKit
+endif
+
+CFLAGS = $(LINK_FRAMEWORKS) \
          -I./src \
          $(ISYSROOT) \
          -arch arm64 \
@@ -24,7 +26,8 @@ CFLAGS = -framework Foundation \
          -miphoneos-version-min=18.0 \
          -fobjc-arc
 
-OBJECTS = src/main.o src/AppDelegate.o src/physrw.o src/util.o src/gadgets.o src/asm.o src/jailbreak.o src/shell.o
+# Only the files we actually need
+OBJECTS = src/main.o src/AppDelegate.o src/shell.o
 
 all: $(TARGET)
 
@@ -37,25 +40,10 @@ $(TARGET): $(OBJECTS)
 src/AppDelegate.o: src/AppDelegate.m src/AppDelegate.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/main.o: src/main.m src/offsets.h src/physrw.h src/util.h src/gadgets.h src/jailbreak.h src/shell.h src/AppDelegate.h
+src/main.o: src/main.m src/offsets.h src/shell.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/physrw.o: src/physrw.c src/physrw.h src/offsets.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-src/util.o: src/util.c src/util.h src/offsets.h src/physrw.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-src/gadgets.o: src/gadgets.c src/gadgets.h src/offsets.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-src/asm.o: src/asm.S
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-src/jailbreak.o: src/jailbreak.c src/jailbreak.h src/offsets.h src/util.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-src/shell.o: src/shell.c src/shell.h src/offsets.h src/util.h src/jailbreak.h
+src/shell.o: src/shell.c src/shell.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
@@ -68,14 +56,13 @@ ipa: $(TARGET)
 	cp $(TARGET) Payload/ProjectSword.app/
 	cp Info.plist Payload/ProjectSword.app/
 	cp $(ENTITLEMENTS_FILE) Payload/ProjectSword.app/
-	if [ -f bootstrap.tar ]; then cp bootstrap.tar Payload/ProjectSword.app/; echo "[+] bootstrap.tar bundled in IPA"; fi
+	if [ -f bootstrap.tar ]; then cp bootstrap.tar Payload/ProjectSword.app/; fi
 ifneq ($(SIGN),0)
 	ldid -S$(ENTITLEMENTS_FILE) Payload/ProjectSword.app/$(TARGET)
 	@echo "[+] Signed with ldid using $(ENTITLEMENTS_FILE)"
 endif
 ifneq ($(wildcard embedded.mobileprovision),)
 	cp embedded.mobileprovision Payload/ProjectSword.app/
-	@echo "[+] Provisioning profile bundled"
 endif
 	zip -r ProjectSword.ipa Payload/
 	rm -rf Payload
