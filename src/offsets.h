@@ -77,6 +77,9 @@
 #define CPSR_USER_INTR_DIS 0x13C0
 
 #define SLIDE(addr) ((addr) + gOffsets.slide)
+#ifdef PAGE_SIZE
+#undef PAGE_SIZE
+#endif
 #define PAGE_SIZE 0x4000ULL
 
 // Page table permission macros

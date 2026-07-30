@@ -13,6 +13,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #include <sys/uio.h>
 #include <sys/stat.h>
+#include <mach/mach_vm.h>
 #include <ptrauth.h>
 
 #include "offsets.h"
