@@ -23,6 +23,47 @@
 #include <aio.h>
 #include <IOKit/IOKitLib.h>
 #import <IOSurface/IOSurfaceRef.h>
+#import <ImageIO/ImageIO.h>
+#import <CoreGraphics/CoreGraphics.h>
+// Minimal valid JPEG (1x1 pixel, baseline, YCbCr)
+static const uint8_t kTinyJPEG[] = {
+    0xFF,0xD8,0xFF,0xE0,0x00,0x10,0x4A,0x46,0x49,0x46,0x00,0x01,0x01,0x00,0x00,0x01,
+    0x00,0x01,0x00,0x00,0xFF,0xDB,0x00,0x43,0x00,0x08,0x06,0x06,0x07,0x06,0x05,0x08,
+    0x07,0x07,0x07,0x09,0x09,0x08,0x0A,0x0C,0x14,0x0D,0x0C,0x0B,0x0B,0x0C,0x19,0x12,
+    0x13,0x0F,0x14,0x1D,0x1A,0x1F,0x1E,0x1D,0x1A,0x1C,0x1C,0x20,0x24,0x2E,0x27,0x20,
+    0x22,0x2C,0x23,0x1C,0x1C,0x28,0x37,0x29,0x2C,0x30,0x31,0x34,0x34,0x34,0x1F,0x27,
+    0x39,0x3D,0x38,0x32,0x3C,0x2E,0x33,0x34,0x32,0xFF,0xC0,0x00,0x0B,0x08,0x00,0x01,
+    0x00,0x01,0x01,0x01,0x11,0x00,0xFF,0xC4,0x00,0x1F,0x00,0x00,0x01,0x05,0x01,0x01,
+    0x01,0x01,0x01,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x02,0x03,0x04,0x05,
+    0x06,0x07,0x08,0x09,0x0A,0x0B,0xFF,0xC4,0x00,0xB5,0x10,0x00,0x02,0x01,0x03,0x03,
+    0x02,0x04,0x03,0x05,0x05,0x04,0x04,0x00,0x00,0x01,0x7D,0x01,0x02,0x03,0x00,0x04,
+    0x11,0x05,0x12,0x21,0x31,0x41,0x06,0x13,0x51,0x61,0x07,0x22,0x71,0x14,0x32,0x81,
+    0x91,0xA1,0x08,0x23,0x42,0xB1,0xC1,0x15,0x52,0xD1,0xF0,0x24,0x33,0x62,0x72,0x82,
+    0x09,0x0A,0x16,0x17,0x18,0x19,0x1A,0x25,0x26,0x27,0x28,0x29,0x2A,0x34,0x35,0x36,
+    0x37,0x38,0x39,0x3A,0x43,0x44,0x45,0x46,0x47,0x48,0x49,0x4A,0x53,0x54,0x55,0x56,
+    0x57,0x58,0x59,0x5A,0x63,0x64,0x65,0x66,0x67,0x68,0x69,0x6A,0x73,0x74,0x75,0x76,
+    0x77,0x78,0x79,0x7A,0x83,0x84,0x85,0x86,0x87,0x88,0x89,0x8A,0x92,0x93,0x94,0x95,
+    0x96,0x97,0x98,0x99,0x9A,0xA2,0xA3,0xA4,0xA5,0xA6,0xA7,0xA8,0xA9,0xAA,0xB2,0xB3,
+    0xB4,0xB5,0xB6,0xB7,0xB8,0xB9,0xBA,0xC2,0xC3,0xC4,0xC5,0xC6,0xC7,0xC8,0xC9,0xCA,
+    0xD2,0xD3,0xD4,0xD5,0xD6,0xD7,0xD8,0xD9,0xDA,0xE1,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,
+    0xE8,0xE9,0xEA,0xF1,0xF2,0xF3,0xF4,0xF5,0xF6,0xF7,0xF8,0xF9,0xFA,0xFF,0xC4,0x00,
+    0x1F,0x01,0x00,0x03,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0xFF,0xC4,
+    0x00,0xB5,0x11,0x00,0x02,0x01,0x02,0x04,0x04,0x03,0x04,0x07,0x05,0x04,0x04,0x00,
+    0x01,0x02,0x77,0x00,0x01,0x02,0x03,0x11,0x04,0x05,0x21,0x31,0x06,0x12,0x41,0x51,
+    0x07,0x61,0x71,0x13,0x22,0x32,0x81,0x08,0x14,0x42,0x91,0xA1,0xB1,0xC1,0x09,0x23,
+    0x33,0x52,0xF0,0x15,0x62,0x72,0xD1,0x0A,0x16,0x24,0x34,0xE1,0x25,0xF1,0x17,0x18,
+    0x19,0x1A,0x26,0x27,0x28,0x29,0x2A,0x35,0x36,0x37,0x38,0x39,0x3A,0x43,0x44,0x45,
+    0x46,0x47,0x48,0x49,0x4A,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5A,0x63,0x64,0x65,
+    0x66,0x67,0x68,0x69,0x6A,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7A,0x82,0x83,0x84,
+    0x85,0x86,0x87,0x88,0x89,0x8A,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,0x9A,0xA2,
+    0xA3,0xA4,0xA5,0xA6,0xA7,0xA8,0xA9,0xAA,0xB2,0xB3,0xB4,0xB5,0xB6,0xB7,0xB8,0xB9,
+    0xBA,0xC2,0xC3,0xC4,0xC5,0xC6,0xC7,0xC8,0xC9,0xCA,0xD2,0xD3,0xD4,0xD5,0xD6,0xD7,
+    0xD8,0xD9,0xDA,0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xE8,0xE9,0xEA,0xF2,0xF3,0xF4,0xF5,
+    0xF6,0xF7,0xF8,0xF9,0xFA,0xFF,0xDA,0x00,0x08,0x01,0x01,0x00,0x00,0x3F,0x00,0x77,
+    0x3F,0xC0,0x7F,0xFF,0xD9
+};
+
 void IOSurfacePrefetchPages(IOSurfaceRef surface);
 
 extern kern_return_t mach_vm_allocate(task_t, mach_vm_address_t *, mach_vm_size_t, int);
@@ -509,123 +550,215 @@ static void diagnostic_iokit(void) {
     printf("=== IOKit Diagnostic Complete ===\n\n");
 }
 
-// ===== AppleJPEGDriver IOKit Fuzzer =====
-static io_connect_t gJpegConn = 0;
+// ===== AppleJPEGDriver Struct + Type Fuzzer =====
+// Tries all 4 user-client types with struct inputs of varying sizes
 
-static bool open_apple_jpeg(void) {
-    if (gJpegConn) return true;
+static io_connect_t g_allJpegConns[4] = {};
+
+static void method_jpeg_struct_fuzz(void) {
+    printf("\n[Method: JPEG_struct] Struct fuzzing AppleJPEGDriver types 0-3...\n");
     io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL,
         IOServiceNameMatching("AppleJPEGDriver"));
-    if (!svc) { printf("[JPEG] service not found\n"); return false; }
-    kern_return_t kr = IOServiceOpen(svc, mach_task_self_, 0, &gJpegConn);
+    if (!svc) { printf("[JPEG_struct] service not found\n"); return; }
+
+    int nOpen = 0;
+    for (uint32_t t = 0; t < 4; t++) {
+        kern_return_t kr = IOServiceOpen(svc, mach_task_self_, t, &g_allJpegConns[t]);
+        if (kr == KERN_SUCCESS) nOpen++;
+    }
     IOObjectRelease(svc);
-    if (kr != KERN_SUCCESS) { printf("[JPEG] IOServiceOpen: %#x\n", kr); return false; }
-    printf("[JPEG] conn=%#x\n", gJpegConn);
-    return true;
-}
+    if (!nOpen) { printf("[JPEG_struct] no connections\n"); return; }
+    printf("[JPEG_struct] opened %d connections (types 0-3)\n", nOpen);
 
-// AppleJPEGDriver external method call wrapper
-static kern_return_t call_jpeg_method(uint32_t method, void *input, size_t inputSz,
-                                       void *output, size_t *outputSz) {
-    uint32_t outputCnt = (uint32_t)(outputSz ? *outputSz / sizeof(uint64_t) : 0);
-    uint32_t inputCnt = (uint32_t)(inputSz / sizeof(uint64_t));
-    kern_return_t kr = IOConnectCallMethod(gJpegConn, method,
-        (uint64_t*)input, inputCnt, NULL, 0,
-        (uint64_t*)output, &outputCnt, NULL, NULL);
-    if (outputSz) *outputSz = outputCnt * sizeof(uint64_t);
-    return kr;
-}
-
-// Create IOSurface with specific pixel format for JPEG driver
-static IOSurfaceRef create_jpeg_surface(uint32_t width, uint32_t height, uint32_t pixelFormat) {
-    uint32_t bpr = (width * 4 + 15) & ~15; // 16-byte aligned row stride
-    uint32_t alloc = bpr * height;
-    NSDictionary *params = @{
-        (__bridge id)kIOSurfaceAllocSize : @(alloc),
-        (__bridge id)kIOSurfaceWidth : @(width),
-        (__bridge id)kIOSurfaceHeight : @(height),
-        (__bridge id)kIOSurfaceBytesPerRow : @(bpr),
-        (__bridge id)kIOSurfacePixelFormat : @(pixelFormat),
-        (__bridge id)kIOSurfaceBytesPerElement : @(4),
-    };
-    return IOSurfaceCreate((__bridge CFDictionaryRef)params);
-}
-
-static void method_apple_jpeg_fuzz(void) {
-    printf("\n[Method: JPEG_fuzz] Fuzzing AppleJPEGDriver...\n");
-    if (!open_apple_jpeg()) { printf("[JPEG] Cannot open driver\n"); return; }
-
-    // Try setSurface with properly configured IOSurfaces at various sizes
-    const uint32_t formats[] = {
-        0x34323066, // '420f' — 420YpCbCr8BiPlanarVideoRange (YpCbCr)
-        0x34323076, // '420v' — 420YpCbCr8BiPlanarFullRange
-        0x42475241, // 'ARGB'
-        0x42475241, // 'BGRA'
-    };
-    const uint32_t sizes[][2] = {
-        {1920, 1080}, {1280, 720}, {640, 480}, {320, 240},
-        {256, 256}, {128, 128}, {64, 64}, {32, 32},
-    };
-
-    for (int f = 0; f < sizeof(formats)/sizeof(formats[0]); f++) {
-        for (int s = 0; s < sizeof(sizes)/sizeof(sizes[0]); s++) {
-            IOSurfaceRef sf = create_jpeg_surface(sizes[s][0], sizes[s][1], formats[f]);
-            if (!sf) { printf("[JPEG] surf %x %dx%d: create failed\n", formats[f], sizes[s][0], sizes[s][1]); continue; }
-
-            uint32_t sid = IOSurfaceGetID(sf);
-            uint64_t args[3] = {sid, sid, 0};
-            kern_return_t kr = call_jpeg_method(0, args, sizeof(args), NULL, NULL);
-            if (kr == KERN_SUCCESS) {
-                printf("[JPEG] setSurface OK: fmt=%#x %dx%d sid=%u\n", formats[f], sizes[s][0], sizes[s][1], sid);
-                // Try decode with this surface
-                uint64_t decArgs[4] = {0, 0, (uint64_t)sizes[s][0] * sizes[s][1] * 4, 0};
-                kr = call_jpeg_method(1, decArgs, sizeof(decArgs), NULL, NULL);
-                printf("[JPEG] decode: kr=%#x\n", kr);
-                // Try encode
-                uint64_t encArgs[5] = {0, 0, (uint64_t)sizes[s][0] * sizes[s][1] * 4, 0, 90};
-                kr = call_jpeg_method(2, encArgs, sizeof(encArgs), NULL, NULL);
-                printf("[JPEG] encode: kr=%#x\n", kr);
-            }
-            CFRelease(sf);
+    // Create test IOSurfaces
+    const uint32_t formats[] = {0x34323066, 0x34323076, 0x42475241, 0x42475241};
+    const uint32_t imgSizes[][2] = {{640,480}, {320,240}, {128,128}, {32,32}};
+    IOSurfaceRef surfaces[8];
+    uint32_t surfaceIDs[8];
+    int nSurf = 0;
+    for (int f = 0; f < 2 && nSurf < 8; f++) {
+        for (int s = 0; s < 2 && nSurf < 8; s++) {
+            uint32_t w = imgSizes[s][0], h = imgSizes[s][1];
+            uint32_t bpr = (w * 4 + 15) & ~15;
+            IOSurfaceRef sf = IOSurfaceCreate((__bridge CFDictionaryRef)@{
+                (__bridge id)kIOSurfaceAllocSize : @(bpr * h),
+                (__bridge id)kIOSurfaceWidth : @(w),
+                (__bridge id)kIOSurfaceHeight : @(h),
+                (__bridge id)kIOSurfaceBytesPerRow : @(bpr),
+                (__bridge id)kIOSurfacePixelFormat : @(formats[f]),
+                (__bridge id)kIOSurfaceBytesPerElement : @(4),
+            });
+            if (sf) { surfaces[nSurf] = sf; surfaceIDs[nSurf] = IOSurfaceGetID(sf); nSurf++; }
         }
     }
 
-    // Also try calling each method (0-15) with a connected surface
-    IOSurfaceRef testSurf = create_jpeg_surface(640, 480, 0x34323066);
-    if (testSurf) {
-        uint32_t sid = IOSurfaceGetID(testSurf);
-        uint64_t setArgs[3] = {sid, sid, 0};
-        call_jpeg_method(0, setArgs, sizeof(setArgs), NULL, NULL);
+    // Struct sizes: 16, 32, 48, 64, 128
+    const size_t structSizes[] = {16, 32, 48, 64, 128, 256};
+    // Patterns: diff struct content
+    const int nPatterns = 5;
+    uint8_t structBuf[256];
 
-        for (uint32_t m = 0; m <= 15; m++) {
-            uint64_t args[8] = {0};
-            size_t outSz = 32;
-            uint64_t output[4];
-            for (int pat = 0; pat < 4; pat++) {
-                memset(args, 0, sizeof(args));
-                switch (pat) {
-                    case 0: args[0] = 0; args[1] = 0x1000; args[2] = 0x1000; break;
-                    case 1: args[0] = 0xFFFFFFFFFFFFFFFFULL; break;
-                    case 2: args[0] = 0; args[1] = 0; args[2] = 0; args[3] = 0; break;
-                    case 3: args[0] = (uint64_t)-1; args[1] = 0x1000; break;
+    int totalCalls = 0, successCalls = 0, diffErrCalls = 0;
+    for (int t = 0; t < 4; t++) {
+        if (!g_allJpegConns[t]) continue;
+        for (uint32_t m = 0; m < 16; m++) {
+            for (int si = 0; si < sizeof(structSizes)/sizeof(structSizes[0]); si++) {
+                size_t sz = structSizes[si];
+                for (int p = 0; p < nPatterns; p++) {
+                    memset(structBuf, 0, sz);
+                    switch (p) {
+                        case 0: // surface IDs
+                            if (sz >= 12 && nSurf > 0) {
+                                *(uint32_t*)(structBuf+0) = surfaceIDs[0];
+                                *(uint32_t*)(structBuf+4) = surfaceIDs[1 % nSurf];
+                                *(uint32_t*)(structBuf+8) = 0;
+                            }
+                            break;
+                        case 1: // surface + dimensions
+                            if (sz >= 16 && nSurf > 0) {
+                                *(uint32_t*)(structBuf+0) = surfaceIDs[0];
+                                *(uint32_t*)(structBuf+4) = 640;
+                                *(uint32_t*)(structBuf+8) = 480;
+                            }
+                            break;
+                        case 2: // data pointers + size
+                            if (sz >= 24) {
+                                *(uint64_t*)(structBuf+0) = (uint64_t)(uintptr_t)kTinyJPEG;
+                                *(uint64_t*)(structBuf+8) = sizeof(kTinyJPEG);
+                                if (nSurf > 0) *(uint32_t*)(structBuf+16) = surfaceIDs[0];
+                            }
+                            break;
+                        case 3: // all ones (fuzz)
+                            memset(structBuf, 0xFF, sz);
+                            break;
+                        case 4: // quality + flags + sizes
+                            if (sz >= 20) {
+                                *(uint32_t*)(structBuf+0) = 90;
+                                *(uint32_t*)(structBuf+4) = 0;
+                                if (nSurf > 0) *(uint32_t*)(structBuf+8) = surfaceIDs[0];
+                                *(uint32_t*)(structBuf+12) = 640;
+                                *(uint32_t*)(structBuf+16) = 480;
+                            }
+                            break;
+                    }
+
+                    totalCalls++;
+                    kern_return_t kr;
+                    if (sz <= 32) {
+                        // Use IOConnectCallMethod with struct input
+                        kr = IOConnectCallMethod(g_allJpegConns[t], m,
+                            NULL, 0, structBuf, (uint32_t)sz, NULL, NULL, NULL, NULL);
+                    } else {
+                        // Use IOConnectCallStructMethod
+                        kr = IOConnectCallStructMethod(g_allJpegConns[t], m,
+                            structBuf, sz, NULL, NULL);
+                    }
+
+                    if (kr == KERN_SUCCESS) {
+                        successCalls++;
+                        printf("[JPEG_struct] type=%d m=%d sz=%zu pat=%d: SUCCESS kr=0\n",
+                               t, m, sz, p);
+                    } else if (kr != 0xe00002c2) {
+                        diffErrCalls++;
+                        printf("[JPEG_struct] type=%d m=%d sz=%zu pat=%d: kr=%#x (non-E02C2)\n",
+                               t, m, sz, p, kr);
+                    }
                 }
-                outSz = sizeof(output);
-                kern_return_t kr = IOConnectCallMethod(gJpegConn, m,
-                    args, 4, NULL, 0, output, (uint32_t*)&outSz, NULL, NULL);
-                if (kr != KERN_SUCCESS && m <= 2)
-                    printf("[JPEG] method %d (pat %d): kr=%#x\n", m, pat, kr);
-                else if (kr != KERN_SUCCESS && m >= 3 && pat == 0)
-                    printf("[JPEG] method %d: kr=%#x\n", m, kr);
-                else if (kr == KERN_SUCCESS)
-                    printf("[JPEG] method %d (pat %d): SUCCESS kr=0 outSz=%zu\n", m, pat, outSz);
             }
         }
-        CFRelease(testSurf);
     }
 
-    IOServiceClose(gJpegConn);
-    gJpegConn = 0;
-    printf("[JPEG] fuzz complete\n");
+    // Also try encode method (2) with real pixel data in an IOSurface
+    if (nSurf > 0 && g_allJpegConns[0]) {
+        // Fill surface 0 with test pixel data
+        IOSurfaceLock(surfaces[0], 0, NULL);
+        memset(IOSurfaceGetBaseAddress(surfaces[0]), 0x80, IOSurfaceGetAllocSize(surfaces[0]));
+        IOSurfaceUnlock(surfaces[0], 0, NULL);
+
+        // Try encode: provide JPEG data in struct, decode to surface
+        for (uint32_t encodeMethod = 0; encodeMethod <= 2; encodeMethod++) {
+            uint8_t encBuf[128] = {};
+            *(uint64_t*)(encBuf) = (uint64_t)(uintptr_t)kTinyJPEG;   // input data ptr
+            *(uint64_t*)(encBuf+8) = sizeof(kTinyJPEG);              // input size
+            *(uint32_t*)(encBuf+16) = surfaceIDs[0];                 // output surface
+            kern_return_t kr = IOConnectCallMethod(g_allJpegConns[0], encodeMethod,
+                NULL, 0, encBuf, sizeof(encBuf), NULL, NULL, NULL, NULL);
+            if (kr != 0xe00002c2) {
+                printf("[JPEG_struct] encode test type=0 m=%d: kr=%#x\n", encodeMethod, kr);
+            }
+        }
+    }
+
+    for (int i = 0; i < 4; i++)
+        if (g_allJpegConns[i]) IOServiceClose(g_allJpegConns[i]);
+    for (int i = 0; i < nSurf; i++)
+        if (surfaces[i]) CFRelease(surfaces[i]);
+
+    printf("[JPEG_struct] complete: %d calls, %d success, %d non-E02C2\n",
+           totalCalls, successCalls, diffErrCalls);
+}
+
+// ===== ImageIO Trace =====
+// Decode a real JPEG via ImageIO, check if result is IOSurface-backed
+
+static void method_imageio_trace(void) {
+    printf("\n[Method: ImageIO] Tracing real JPEG decode via ImageIO...\n");
+    NSData *jpegData = [NSData dataWithBytesNoCopy:(void*)kTinyJPEG
+                                            length:sizeof(kTinyJPEG)
+                                      freeWhenDone:NO];
+    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)jpegData, NULL);
+    if (!src) { printf("[ImageIO] source create failed\n"); return; }
+
+    CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+    CFRelease(src);
+    if (!img) { printf("[ImageIO] image decode failed\n"); return; }
+
+    size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
+    printf("[ImageIO] decoded: %zux%zu\n", w, h);
+
+    // Try private API CGImageGetIOSurface
+    static IOSurfaceRef (*sCGImageGetIOSurface)(CGImageRef) = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        sCGImageGetIOSurface = dlsym(RTLD_DEFAULT, "CGImageGetIOSurface");
+    });
+    IOSurfaceRef surf = sCGImageGetIOSurface ? sCGImageGetIOSurface(img) : NULL;
+    if (surf) {
+        uint32_t sid = IOSurfaceGetID(surf);
+        printf("[ImageIO] IOSurface-backed! sid=%u size=%zux%zu fmt=%#x\n",
+               sid, IOSurfaceGetWidth(surf), IOSurfaceGetHeight(surf),
+               IOSurfaceGetPixelFormat(surf));
+
+        // Try calling JPEGDriver methods with this known-good surface
+        io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL,
+            IOServiceNameMatching("AppleJPEGDriver"));
+        if (svc) {
+            io_connect_t conn = 0;
+            kern_return_t kr = IOServiceOpen(svc, mach_task_self_, 0, &conn);
+            if (kr == KERN_SUCCESS) {
+                printf("[ImageIO] Trying JPEGDriver methods with ImageIO surface...\n");
+                for (uint32_t m = 0; m < 8; m++) {
+                    uint64_t args[4] = {sid, sid, 0, 0};
+                    size_t outSz = 32;
+                    uint64_t out[4] = {};
+                    kr = IOConnectCallMethod(conn, m, args, 4, NULL, 0,
+                        out, (uint32_t*)&outSz, NULL, NULL);
+                    if (kr == KERN_SUCCESS)
+                        printf("[ImageIO] JPEGDriver m=%d w/IO surface: SUCCESS\n", m);
+                }
+                IOServiceClose(conn);
+            }
+            IOObjectRelease(svc);
+        }
+    } else {
+        printf("[ImageIO] not IOSurface-backed (fallback render or bitmap)\n");
+        // Check data provider type
+        CGDataProviderRef dp = CGImageGetDataProvider(img);
+        if (dp) printf("[ImageIO] has data provider\n");
+    }
+
+    CFRelease(img);
+    printf("[ImageIO] trace complete\n");
 }
 
 // ===== H11ANE (Neural Engine) Fuzzer =====
@@ -1166,8 +1299,11 @@ bool run_darksword(void) {
     // Phase 7: H11ANE fuzzing
     method_h11ane_fuzz();
 
-    // Phase 8: AppleJPEGDriver IOKit fuzzing
-    method_apple_jpeg_fuzz();
+    // Phase 8: JPEGDriver struct fuzzing (types 0-3, struct sizes, patterns)
+    method_jpeg_struct_fuzz();
+
+    // Phase 9: ImageIO trace — decode real JPEG, check IOSurface backing
+    method_imageio_trace();
 
     printf("=== Results ===\n");
     printf("SystemMemory overlap: %d\n", sysmem);
