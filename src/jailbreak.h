@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <unistd.h>
 #include <mach/mach.h>
 
 // Sandbox escape

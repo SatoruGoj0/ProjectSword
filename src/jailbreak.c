@@ -22,8 +22,8 @@ extern void kwrite64(uint64_t addr, uint64_t val);
 extern uint32_t kread32(uint64_t addr);
 extern void kwrite32(uint64_t addr, uint32_t val);
 extern uint64_t kread_ptr(uint64_t addr);
-extern bool kread_buf(uint64_t addr, void *buf, size_t len);
-extern void kwrite_buf(uint64_t addr, const void *buf, size_t len);
+extern void kread_buf(uint64_t addr, void *buf, size_t len);
+extern void kwrite_buf(uint64_t addr, void *buf, size_t len);
 extern bool platformize_proc(void);
 
 // Forward declarations
