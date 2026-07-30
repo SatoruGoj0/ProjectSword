@@ -30,6 +30,7 @@ extern kern_return_t mach_vm_map(task_t, mach_vm_address_t *, mach_vm_size_t,
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 #include "offsets.h"
+#include "AppDelegate.h"
 
 // ===== Global state =====
 static uint64_t randomMarker;
