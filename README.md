@@ -47,10 +47,10 @@ git clone https://github.com/ibrahimatmorphis/ProjectSword.git
 cd ProjectSword
 
 # Local build (requires macOS + Xcode)
-cd ios18-research/ProjectSword
+cd ProjectSword
 make ipa
 
-# Output: ios18-research/ProjectSword/ProjectSword.ipa
+# Output: ProjectSword/ProjectSword.ipa
 ```
 
 > The bootstrap is automatically downloaded and embedded during CI.

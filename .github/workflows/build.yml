@@ -16,35 +16,37 @@ on:
 jobs:
   build:
     runs-on: macos-15
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           brew install ldid zstd
-          if [ ! -f ios18-research/ProjectSword/bootstrap.tar ]; then
+
+      - name: Download Procursus bootstrap
+        run: |
+          if [ ! -f bootstrap.tar ]; then
             echo "[*] Downloading Procursus bootstrap..."
             curl -L -o /tmp/bootstrap.tar.zst \
               "https://apt.procurs.us/bootstraps/1900/bootstrap-iphoneos-arm64.tar.zst"
-            zstd -d /tmp/bootstrap.tar.zst -c > ios18-research/ProjectSword/bootstrap.tar
-            echo "[+] Bootstrap downloaded ($(ls -lh ios18-research/ProjectSword/bootstrap.tar | awk '{print $5}'))"
+            zstd -d /tmp/bootstrap.tar.zst -c > bootstrap.tar
+            echo "[+] Bootstrap downloaded ($(ls -lh bootstrap.tar | awk '{print $5}'))"
           fi
 
       - name: Build ProjectSword
-        run: |
-          cd ios18-research/ProjectSword
-          make CI=1
+        run: make CI=1
 
       - name: Package IPA
-        run: |
-          cd ios18-research/ProjectSword
-          make ipa CI=1 SIGN=0
+        run: make ipa CI=1 SIGN=0
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ProjectSword-$(echo ${{ github.ref_name }} | sed 's:/:-:g')
-          path: ios18-research/ProjectSword/ProjectSword.ipa
+          name: ProjectSword-${{ github.ref_name }}
+          path: ProjectSword.ipa
 
       - name: Create Release
         if: github.event.inputs.release == 'true' && github.ref == 'refs/heads/main'
@@ -52,5 +54,5 @@ jobs:
         with:
           name: ProjectSword ${{ github.run_number }}
           tag_name: v${{ github.run_number }}
-          files: ios18-research/ProjectSword/ProjectSword.ipa
+          files: ProjectSword.ipa
           make_latest: true

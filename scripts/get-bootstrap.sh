@@ -5,7 +5,7 @@
 
 set -e
 
-OUTPUT_FILE="ios18-research/ProjectSword/bootstrap.tar"
+OUTPUT_FILE="bootstrap.tar"
 TEMP_ZST="/tmp/bootstrap.tar.zst"
 BOOTSTRAP_URL="https://apt.procurs.us/bootstraps/1900/bootstrap-iphoneos-arm64.tar.zst"
 

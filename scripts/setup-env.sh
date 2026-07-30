@@ -29,8 +29,8 @@ fi
 echo "[+] iOS SDK: ${SDK_PATH}"
 
 # Check bootstrap
-if [ ! -f "ios18-research/ProjectSword/bootstrap.tar" ]; then
-    echo "[*] bootstrap.tar not found. Run scripts/get-bootstrap.sh"
+if [ ! -f "bootstrap.tar" ]; then
+    echo "[*] bootstrap.tar not found. Run 'scripts/get-bootstrap.sh' from the project root."
 fi
 
 echo "[+] Environment ready. Run 'cd ios18-research/ProjectSword && make ipa' to build."
