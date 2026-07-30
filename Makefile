@@ -11,6 +11,7 @@ ISYSROOT := -isysroot $(SDK_PATH)
 ENTITLEMENTS_FILE = $(if $(LITE),entitlements.lite.plist,entitlements.plist)
 
 CFLAGS = -framework Foundation \
+         -framework UIKit \
          -framework CoreServices \
          -framework IOSurface \
          -framework IOKit \
@@ -23,7 +24,7 @@ CFLAGS = -framework Foundation \
          -miphoneos-version-min=18.0 \
          -fobjc-arc
 
-OBJECTS = src/main.o src/physrw.o src/util.o src/gadgets.o src/asm.o src/jailbreak.o src/shell.o
+OBJECTS = src/main.o src/AppDelegate.o src/physrw.o src/util.o src/gadgets.o src/asm.o src/jailbreak.o src/shell.o
 
 all: $(TARGET)
 
@@ -33,7 +34,10 @@ sign: $(TARGET)
 $(TARGET): $(OBJECTS)
 	$(CC) $(CFLAGS) -o $@ $^
 
-src/main.o: src/main.m src/offsets.h src/physrw.h src/util.h src/gadgets.h src/jailbreak.h src/shell.h
+src/AppDelegate.o: src/AppDelegate.m src/AppDelegate.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+src/main.o: src/main.m src/offsets.h src/physrw.h src/util.h src/gadgets.h src/jailbreak.h src/shell.h src/AppDelegate.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 src/physrw.o: src/physrw.c src/physrw.h src/offsets.h
@@ -73,7 +77,7 @@ ifneq ($(wildcard embedded.mobileprovision),)
 	cp embedded.mobileprovision Payload/ProjectSword.app/
 	@echo "[+] Provisioning profile bundled"
 endif
-	cd Payload && zip -r ../ProjectSword.ipa ProjectSword.app/
+	zip -r ProjectSword.ipa Payload/
 	rm -rf Payload
 	@echo "[+] IPA: ProjectSword.ipa"
 	@echo "[+] Entitlements: $(ENTITLEMENTS_FILE)"
