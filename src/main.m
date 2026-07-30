@@ -81,7 +81,7 @@ void *free_thread(void *arg) {
     while (freeThreadStart == 0) {} while (goSync == 0) {}
     while (goSync != 0) {
         while (raceSync == 0) {}
-        mach_vm_map(mach_task_self(), &freeTarget, freeTargetSize, 0,
+        mach_vm_map(mach_task_self(), (mach_vm_address_t *)&freeTarget, freeTargetSize, 0,
             VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, targetObject, targetObjectOffset, 0,
             VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
         raceSync = 0;
@@ -402,9 +402,7 @@ void IODMACommand_prepare(mach_port_t cmd, mach_port_t md) { (void)cmd; (void)md
 void IODMACommand_readFrom(mach_port_t cmd, mach_port_t from, uint64_t len) { (void)cmd; (void)from; (void)len; }
 void IODMACommand_writeTo(mach_port_t cmd, mach_port_t to, uint64_t len) { (void)cmd; (void)to; (void)len; }
 
-// ===== Missing kread/kwrite helpers =====
-uint16_t kread16(uint64_t where) { uint16_t v; early_kread(where, &v, 2); return v; }
-uint8_t  kread8(uint64_t where)  { uint8_t v;  early_kread(where, &v, 1); return v; }
+// ===== Missing kwrite helpers =====
 void kwrite16(uint64_t where, uint16_t val) {
     uint8_t buf[0x20]; early_kread(where, buf, 0x20);
     *(uint16_t*)buf = val; set_kaddr(where);
