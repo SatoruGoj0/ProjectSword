@@ -27,23 +27,63 @@ void log_printf(NSString *format, ...) {
     self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     self.window.backgroundColor = [UIColor blackColor];
 
-    UITextView *tv = [[UITextView alloc] initWithFrame:self.window.bounds];
+    CGFloat w = self.window.bounds.size.width;
+    CGFloat h = self.window.bounds.size.height;
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 40, w, 40)];
+    title.text = @"ProjectSword";
+    title.textColor = [UIColor greenColor];
+    title.backgroundColor = [UIColor clearColor];
+    title.font = [UIFont boldSystemFontOfSize:20];
+    title.textAlignment = NSTextAlignmentCenter;
+    [self.window addSubview:title];
+
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    btn.frame = CGRectMake(w/2 - 80, 90, 160, 44);
+    [btn setTitle:@"START EXPLOIT" forState:UIControlStateNormal];
+    [btn setTitleColor:[UIColor greenColor] forState:UIControlStateNormal];
+    btn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    btn.layer.borderColor = [UIColor greenColor].CGColor;
+    btn.layer.borderWidth = 1;
+    btn.layer.cornerRadius = 8;
+    [btn addTarget:self action:@selector(startExploit) forControlEvents:UIControlEventTouchUpInside];
+
+    UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    clearBtn.frame = CGRectMake(w - 70, 90, 60, 44);
+    [clearBtn setTitle:@"CLEAR" forState:UIControlStateNormal];
+    [clearBtn setTitleColor:[UIColor grayColor] forState:UIControlStateNormal];
+    clearBtn.titleLabel.font = [UIFont systemFontOfSize:13];
+    [clearBtn addTarget:self action:@selector(clearLog) forControlEvents:UIControlEventTouchUpInside];
+
+    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(0, 140, w, h - 140)];
     tv.backgroundColor = [UIColor blackColor];
     tv.textColor = [UIColor greenColor];
     tv.font = [UIFont fontWithName:@"Menlo" size:11];
     tv.editable = NO;
     tv.selectable = NO;
     tv.text = @"";
-    [self.window addSubview:tv];
-    self.logView = tv;
 
+    [self.window addSubview:tv];
+    [self.window addSubview:btn];
+    [self.window addSubview:clearBtn];
     [self.window makeKeyAndVisible];
 
+    self.logView = tv;
+
+    log_printf(@"ProjectSword loaded. Tap START EXPLOIT to begin.\n");
+
+    return YES;
+}
+
+- (void)clearLog {
+    self.logView.text = @"";
+}
+
+- (void)startExploit {
+    log_printf(@"\n--- Starting exploit ---\n");
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         run_jailbreak();
     });
-
-    return YES;
 }
 
 @end

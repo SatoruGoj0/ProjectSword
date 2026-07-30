@@ -19,6 +19,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <stdarg.h>
 
 extern kern_return_t mach_vm_allocate(task_t, mach_vm_address_t *, mach_vm_size_t, int);
 extern kern_return_t mach_vm_deallocate(task_t, mach_vm_address_t, mach_vm_size_t);
@@ -61,29 +62,15 @@ uint64_t gOurPmap, gKernelPmap, gKernelBase, gKernelSlide;
 // ===== Helpers =====
 #define FAILURE(c) do { log_printf(@"[-] FAILURE at %s:%d\n", __FILE__, __LINE__); return; } while(0)
 
-void redirect_stdout(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        int pfd[2];
-        if (pipe(pfd) == 0) {
-            dup2(pfd[1], STDOUT_FILENO);
-            setvbuf(stdout, NULL, _IONBF, 0);
-            fcntl(pfd[0], F_SETFL, O_NONBLOCK);
-            int rfd = pfd[0];
-            dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, rfd, 0,
-                dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0));
-            dispatch_source_set_event_handler(src, ^{
-                char buf[4096];
-                ssize_t n = read(rfd, buf, sizeof(buf) - 1);
-                if (n > 0) {
-                    buf[n] = 0;
-                    log_printf(@"%s", buf);
-                }
-            });
-            dispatch_resume(src);
-        }
-    });
+void c_log(const char *fmt, ...) {
+    char buf[4096];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    log_printf(@"%s", buf);
 }
+#define printf(...) c_log(__VA_ARGS__)
 
 void memset64(void *ptr, uint64_t val, size_t sz) {
     for (size_t i = 0; i < sz; i += 8)
@@ -755,7 +742,6 @@ bool remount_private_preboot(void) {
 
 void run_jailbreak(void) {
     @autoreleasepool {
-        redirect_stdout();
         printf("=== ProjectSword - iOS 18.2.1 A14 ===\n\n");
 
         // Phase 1: Kernel R/W via DarkSword (ICMP6 socket)
