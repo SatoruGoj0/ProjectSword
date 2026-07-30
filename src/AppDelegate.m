@@ -27,6 +27,10 @@ void log_printf(NSString *format, ...) {
     self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     self.window.backgroundColor = [UIColor blackColor];
 
+    UIViewController *vc = [[UIViewController alloc] init];
+    vc.view.backgroundColor = [UIColor blackColor];
+    self.window.rootViewController = vc;
+
     CGFloat w = self.window.bounds.size.width;
     CGFloat h = self.window.bounds.size.height;
 
@@ -36,7 +40,7 @@ void log_printf(NSString *format, ...) {
     title.backgroundColor = [UIColor clearColor];
     title.font = [UIFont boldSystemFontOfSize:20];
     title.textAlignment = NSTextAlignmentCenter;
-    [self.window addSubview:title];
+    [vc.view addSubview:title];
 
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
     btn.frame = CGRectMake(w/2 - 80, 90, 160, 44);
@@ -63,9 +67,9 @@ void log_printf(NSString *format, ...) {
     tv.selectable = NO;
     tv.text = @"";
 
-    [self.window addSubview:tv];
-    [self.window addSubview:btn];
-    [self.window addSubview:clearBtn];
+    [vc.view addSubview:tv];
+    [vc.view addSubview:btn];
+    [vc.view addSubview:clearBtn];
     [self.window makeKeyAndVisible];
 
     self.logView = tv;
