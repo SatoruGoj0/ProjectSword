@@ -25,7 +25,7 @@ ProjectSword/
 │   └── offsets.h          # Verified struct offsets for xnu-11215.62.3
 ├── .github/workflows/     # CI/CD: GitHub Actions macOS runner
 ├── scripts/               # Bootstrap download helper
-├── bootstrap.tar          # Procursus bootstrap (Git LFS; committed by user)
+├── bootstrap.tar          # Procursus bootstrap (downloaded at build time)
 ├── Makefile               # Build system
 ├── Info.plist
 └── entitlements.plist     # IOKit + security entitlements
@@ -40,39 +40,34 @@ ProjectSword/
 
 ## Build
 
-### 1. Get the bootstrap (optional, for full bootstrap install)
+### Build IPA
 
 ```bash
 git clone https://github.com/ibrahimatmorphis/ProjectSword.git
 cd ProjectSword
 
-# Option A — download via script
-./scripts/get-bootstrap.sh
-
-# Option B — download manually from:
-#   https://github.com/ProcursusTeam/Procursus/releases
-#   (get bootstrap-iphoneos-arm64e-rootless.tar.xz, extract to bootstrap.tar)
-
-# Commit with Git LFS
-git lfs track ios18-research/ProjectSword/bootstrap.tar
-git add ios18-research/ProjectSword/bootstrap.tar .gitattributes
-git commit -m "Add Procursus bootstrap"
-git push
-```
-
-### 2. Build IPA
-
-```bash
-# Local build
+# Local build (requires macOS + Xcode)
 cd ios18-research/ProjectSword
 make ipa
 
 # Output: ios18-research/ProjectSword/ProjectSword.ipa
 ```
 
+> The bootstrap is automatically downloaded and embedded during CI.
+> For local builds without downloading bootstrap, add `SKIP_BOOTSTRAP=1`:
+> ```bash
+> make ipa SKIP_BOOTSTRAP=1
+> ```
+
 ### Via CI (GitHub Actions)
 
-Push `bootstrap.tar` to the repo (with Git LFS), then push any branch — the workflow builds automatically. Download the IPA from **Actions** tab → workflow run → **Artifacts**.
+Push any branch — the workflow builds automatically. The CI:
+1. Downloads the Procursus bootstrap from `apt.procurs.us`
+2. Decompresses with `zstd`
+3. Builds the IPA
+4. Uploads it as a build artifact
+
+Download the IPA from **Actions** tab → workflow run → **Artifacts**.
 
 Trigger a release build:
 ```bash
