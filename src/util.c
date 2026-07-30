@@ -1,6 +1,7 @@
 #include "util.h"
 #include "offsets.h"
 #include "physrw.h"
+#include "gadgets.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
