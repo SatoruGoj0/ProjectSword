@@ -1,0 +1,29 @@
+# Build artifacts
+ProjectSword
+*.o
+*.ipa
+Payload/
+
+# Kernel binaries (too large for git)
+ios18-research/*.dmg
+ios18-research/kernelcache.release.*
+ios18-research/kernelcache.research.*
+
+# Bootstrap (downloaded separately)
+bootstrap.tar
+bootstrap.tar.xz
+
+# Xcode user state
+*.xcuserdata
+*.xcworkspace
+DerivedData/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+*.dSYM
