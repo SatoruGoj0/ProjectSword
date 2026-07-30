@@ -58,7 +58,7 @@ void log_printf(NSString *format, ...) {
     UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(0, 140, w, h - 140)];
     tv.backgroundColor = [UIColor blackColor];
     tv.textColor = [UIColor greenColor];
-    tv.font = [UIFont fontWithName:@"Menlo" size:11];
+    tv.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
     tv.editable = NO;
     tv.selectable = NO;
     tv.text = @"";
