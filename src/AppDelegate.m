@@ -52,6 +52,13 @@ void log_printf(NSString *format, ...) {
     btn.layer.cornerRadius = 8;
     [btn addTarget:self action:@selector(startExploit) forControlEvents:UIControlEventTouchUpInside];
 
+    UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    copyBtn.frame = CGRectMake(w - 140, 90, 60, 44);
+    [copyBtn setTitle:@"COPY" forState:UIControlStateNormal];
+    [copyBtn setTitleColor:[UIColor greenColor] forState:UIControlStateNormal];
+    copyBtn.titleLabel.font = [UIFont systemFontOfSize:13];
+    [copyBtn addTarget:self action:@selector(copyLog) forControlEvents:UIControlEventTouchUpInside];
+
     UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     clearBtn.frame = CGRectMake(w - 70, 90, 60, 44);
     [clearBtn setTitle:@"CLEAR" forState:UIControlStateNormal];
@@ -69,6 +76,7 @@ void log_printf(NSString *format, ...) {
 
     [vc.view addSubview:tv];
     [vc.view addSubview:btn];
+    [vc.view addSubview:copyBtn];
     [vc.view addSubview:clearBtn];
     [self.window makeKeyAndVisible];
 
@@ -81,6 +89,12 @@ void log_printf(NSString *format, ...) {
 
 - (void)clearLog {
     self.logView.text = @"";
+}
+
+- (void)copyLog {
+    UIPasteboard *pb = [UIPasteboard generalPasteboard];
+    pb.string = self.logView.text;
+    log_printf(@"[COPY] %lu chars copied to clipboard\n", (unsigned long)pb.string.length);
 }
 
 - (void)startExploit {
