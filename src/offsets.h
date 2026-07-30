@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <mach/mach.h>
 
 // Device: iPhone 12 (iPhone13,2) - A14 Bionic (arm64e)
 // iOS 18.2.1 (build 22C161)
