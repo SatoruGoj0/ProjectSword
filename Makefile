@@ -40,7 +40,7 @@ $(TARGET): $(OBJECTS)
 src/AppDelegate.o: src/AppDelegate.m src/AppDelegate.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/main.o: src/main.m src/offsets.h src/shell.h
+src/main.o: src/main.m src/offsets.h src/shell.h src/AppDelegate.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 src/shell.o: src/shell.c src/shell.h
