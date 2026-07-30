@@ -22,7 +22,15 @@ jobs:
           lfs: true
 
       - name: Install dependencies
-        run: brew install ldid
+        run: |
+          brew install ldid zstd
+          if [ ! -f ios18-research/ProjectSword/bootstrap.tar ]; then
+            echo "[*] Downloading Procursus bootstrap..."
+            curl -L -o /tmp/bootstrap.tar.zst \
+              "https://apt.procurs.us/bootstraps/1900/bootstrap-iphoneos-arm64.tar.zst"
+            zstd -d /tmp/bootstrap.tar.zst -o ios18-research/ProjectSword/bootstrap.tar
+            echo "[+] Bootstrap downloaded ($(ls -lh ios18-research/ProjectSword/bootstrap.tar | awk '{print $5}'))"
+          fi
 
       - name: Build ProjectSword
         run: |
