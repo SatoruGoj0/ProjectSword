@@ -36,17 +36,19 @@ jobs:
             echo "[+] Bootstrap downloaded ($(ls -lh bootstrap.tar | awk '{print $5}'))"
           fi
 
-      - name: Build ProjectSword
-        run: make CI=1
+      - name: Build ProjectSword (full — TrollStore)
+        run: make CI=1 ipa && mv ProjectSword.ipa ProjectSword-full.ipa
 
-      - name: Package IPA
-        run:           make ipa CI=1
+      - name: Build ProjectSword (lite — ESign / cert signing)
+        run: make CI=1 LITE=1 ipa && mv ProjectSword.ipa ProjectSword-lite.ipa
 
-      - name: Upload IPA artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ProjectSword-${{ github.ref_name }}
-          path: ProjectSword.ipa
+          path: |
+            ProjectSword-full.ipa
+            ProjectSword-lite.ipa
 
       - name: Create Release
         if: github.event.inputs.release == 'true' && github.ref == 'refs/heads/main'
@@ -54,5 +56,7 @@ jobs:
         with:
           name: ProjectSword ${{ github.run_number }}
           tag_name: v${{ github.run_number }}
-          files: ProjectSword.ipa
+          files: |
+            ProjectSword-full.ipa
+            ProjectSword-lite.ipa
           make_latest: true
