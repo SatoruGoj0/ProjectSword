@@ -1,16 +1,14 @@
 TARGET = ProjectSword
 CC = clang
 
-# CI flag — set CI=1 on GitHub Actions runners
-ifneq ($(CI),1)
-# Local macOS: get SDK path dynamically
+# CI flag — set CI=1 on GitHub Actions runners (both branches do same thing now)
 SDK_PATH := $(shell xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
 ISYSROOT := -isysroot $(SDK_PATH)
-else
-# CI runner: Xcode is installed at standard path
-SDK_PATH := $(shell xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
-ISYSROOT := -isysroot $(SDK_PATH)
-endif
+
+# Lite mode — strip private entitlements for regular developer signing
+#   make LITE=1 ipa   → uses entitlements.lite.plist (installs but won't exploit)
+#   make ipa          → uses entitlements.plist (needs TrollStore)
+ENTITLEMENTS_FILE = $(if $(LITE),entitlements.lite.plist,entitlements.plist)
 
 CFLAGS = -framework Foundation \
          -framework CoreServices \
@@ -30,7 +28,7 @@ OBJECTS = src/main.o src/physrw.o src/util.o src/gadgets.o src/asm.o src/jailbre
 all: $(TARGET)
 
 sign: $(TARGET)
-	ldid -Sentitlements.plist $@
+	ldid -S$(ENTITLEMENTS_FILE) $@
 
 $(TARGET): $(OBJECTS)
 	$(CC) $(CFLAGS) -o $@ $^
@@ -65,11 +63,11 @@ ipa: $(TARGET)
 	mkdir -p Payload/ProjectSword.app
 	cp $(TARGET) Payload/ProjectSword.app/
 	cp Info.plist Payload/ProjectSword.app/
-	cp entitlements.plist Payload/ProjectSword.app/
+	cp $(ENTITLEMENTS_FILE) Payload/ProjectSword.app/
 	if [ -f bootstrap.tar ]; then cp bootstrap.tar Payload/ProjectSword.app/; echo "[+] bootstrap.tar bundled in IPA"; fi
 ifneq ($(SIGN),0)
-	ldid -Sentitlements.plist Payload/ProjectSword.app/$(TARGET)
-	@echo "[+] Signed with ldid (ad-hoc)"
+	ldid -S$(ENTITLEMENTS_FILE) Payload/ProjectSword.app/$(TARGET)
+	@echo "[+] Signed with ldid using $(ENTITLEMENTS_FILE)"
 endif
 ifneq ($(wildcard embedded.mobileprovision),)
 	cp embedded.mobileprovision Payload/ProjectSword.app/
@@ -78,5 +76,6 @@ endif
 	cd Payload && zip -r ../ProjectSword.ipa ProjectSword.app/
 	rm -rf Payload
 	@echo "[+] IPA: ProjectSword.ipa"
+	@echo "[+] Entitlements: $(ENTITLEMENTS_FILE)"
 
 .PHONY: all clean sign ipa
