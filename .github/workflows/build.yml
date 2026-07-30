@@ -40,7 +40,7 @@ jobs:
         run: make CI=1
 
       - name: Package IPA
-        run: make ipa CI=1 SIGN=0
+        run:           make ipa CI=1
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
