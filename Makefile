@@ -13,7 +13,7 @@ LINK_FRAMEWORKS = -framework Foundation -framework UIKit -framework Security -fr
 
 # Always link IOSurface/IOKit — lite build tries IOSurface and falls back
 # to pure Mach VM if the entitlement is unavailable at runtime
-LINK_FRAMEWORKS += -framework IOSurface -framework IOKit
+LINK_FRAMEWORKS += -framework IOSurface -framework IOKit -framework CoreGraphics -framework ImageIO
 
 CFLAGS = $(LINK_FRAMEWORKS) \
          -I./src \
