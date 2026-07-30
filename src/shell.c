@@ -1,6 +1,6 @@
 #include "shell.h"
 #include "offsets.h"
-#include "util.h"
+
 #include "jailbreak.h"
 #include <stdio.h>
 #include <stdlib.h>

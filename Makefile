@@ -43,7 +43,7 @@ src/AppDelegate.o: src/AppDelegate.m src/AppDelegate.h
 src/main.o: src/main.m src/offsets.h src/shell.h src/AppDelegate.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-src/shell.o: src/shell.c src/shell.h
+src/shell.o: src/shell.c src/shell.h src/offsets.h src/jailbreak.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:

