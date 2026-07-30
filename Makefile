@@ -11,11 +11,9 @@ ENTITLEMENTS_FILE = $(if $(LITE),entitlements.lite.plist,entitlements.plist)
 # Always link Foundation, UIKit, Security — needed regardless of mode
 LINK_FRAMEWORKS = -framework Foundation -framework UIKit -framework Security -framework CoreServices
 
-# Lite builds avoid IOSurface/IOKit (needs private entitlements)
-# Full builds can use them (TrollStore-only)
-ifneq ($(LITE),1)
+# Always link IOSurface/IOKit — lite build tries IOSurface and falls back
+# to pure Mach VM if the entitlement is unavailable at runtime
 LINK_FRAMEWORKS += -framework IOSurface -framework IOKit
-endif
 
 CFLAGS = $(LINK_FRAMEWORKS) \
          -I./src \
