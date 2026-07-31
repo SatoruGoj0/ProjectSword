@@ -61,7 +61,9 @@ def parse_macho(path):
     return data, cmds
 
 def find_string(data, s):
-    return data.find(s.encode())
+    if isinstance(s, str):
+        s = s.encode()
+    return data.find(s)
 
 def find_section(cmds, segname, sectname):
     for cmd, cmdsize, payload in cmds:
