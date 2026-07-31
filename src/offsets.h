@@ -98,5 +98,7 @@ uint64_t get_ucred_from_proc(uint64_t proc);
 // ===== Bootstrap / Sileo =====
 bool install_bootstrap(void);
 bool install_sileo(void);
+bool remount_private_preboot(void);
+bool load_trust_cache(const char *path);
 
 #endif

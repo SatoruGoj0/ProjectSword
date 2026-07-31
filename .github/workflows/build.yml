@@ -36,6 +36,14 @@ jobs:
             echo "[+] Bootstrap downloaded ($(ls -lh bootstrap.tar | awk '{print $5}'))"
           fi
 
+      - name: Download Sileo deb (rootless)
+        run: |
+          echo "[*] Downloading Sileo..."
+          curl -L -o sileo.deb \
+            "https://repo.getsileo.app/./pool/org.coolstar.sileo_2.5.1_iphoneos-arm64.deb" \
+            --retry 3 --retry-delay 5 || echo "[-] Sileo download failed (build continues)"
+          ls -lh sileo.deb 2>/dev/null || echo "[-] No sileo.deb"
+
       - name: Build ProjectSword (full — TrollStore)
         run: make CI=1 ipa && mv ProjectSword.ipa ProjectSword-full.ipa
 

