@@ -60,3 +60,63 @@ jobs:
             ProjectSword-full.ipa
             ProjectSword-lite.ipa
           make_latest: true
+
+  analyze-kernel:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          brew install blacktop/tap/ipsw
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyimg4 requests
+
+      - name: Download IPSW (8.9 GB)
+        run: |
+          IPSW_URL="https://updates.cdn-apple.com/2024FallFCS/fullrestores/072-56463/D18FEB94-3626-4074-80AD-D90F44E7D730/iPhone13,2,iPhone13,3_18.2.1_22C161_Restore.ipsw"
+          echo "[*] Downloading IPSW (8.9 GB)..."
+          curl -L -o /tmp/ipsw.zip "$IPSW_URL" --retry 3 --retry-delay 10 --progress-bar
+          echo "[+] Downloaded $(ls -lh /tmp/ipsw.zip | awk '{print $5}')"
+          df -h /tmp | tail -1
+
+      - name: Extract kernelcache (ipsw tool handles cryptex)
+        run: |
+          echo "=== IPSW contents (top-level) ==="
+          unzip -l /tmp/ipsw.zip | head -40
+          echo ""
+          echo "=== kernelcache/cryptex files ==="
+          unzip -l /tmp/ipsw.zip | grep -iE "kernelcache|cryptex|\.aea" | head -20
+          mkdir -p /tmp/kernel_out
+          ipsw kernelcache extract /tmp/ipsw.zip -o /tmp/kernel_out 2>&1 || echo "ipsw kernelcache extract failed"
+          ls -lh /tmp/kernel_out/ || true
+
+      - name: Free disk space
+        run: |
+          rm -f /tmp/ipsw.zip
+          df -h /tmp | tail -1
+
+      - name: Analyze AppleJPEGDriver dispatch table
+        run: |
+          KC=$(find /tmp/kernel_out -name "kernelcache*" -type f 2>/dev/null | head -1)
+          if [ -z "$KC" ]; then KC=$(find /tmp -name "kernelcache*" -type f 2>/dev/null | head -1); fi
+          echo "kernelcache found: $KC"
+          if [ -n "$KC" ]; then
+            file "$KC"
+            cp "$KC" /tmp/kernelcache.macho
+            python3 tools/analyze_jpeg_dispatch.py /tmp/kernelcache.macho | tee jpeg_dispatch_analysis.txt
+          else
+            echo "[-] No kernelcache extracted - investigating IPSW structure"
+            exit 1
+          fi
+
+      - name: Upload analysis results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-analysis
+          path: |
+            /tmp/kernelcache.macho
+            /tmp/kernel_out/
+            jpeg_dispatch_analysis.txt
+          if-no-files-found: warn
