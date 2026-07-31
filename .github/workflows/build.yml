@@ -80,16 +80,23 @@ jobs:
           echo "[+] Downloaded $(ls -lh /tmp/ipsw.zip | awk '{print $5}')"
           df -h /tmp | tail -1
 
-      - name: Extract kernelcache (ipsw tool handles cryptex)
+      - name: Extract kernelcache (ipsw extract --kernel, handles cryptex + key lookup)
         run: |
-          echo "=== IPSW contents (top-level) ==="
-          unzip -l /tmp/ipsw.zip | head -40
-          echo ""
-          echo "=== kernelcache/cryptex files ==="
+          echo "=== IPSW contents (kernelcache/cryptex files) ==="
           unzip -l /tmp/ipsw.zip | grep -iE "kernelcache|cryptex|\.aea" | head -20
           mkdir -p /tmp/kernel_out
-          ipsw kernelcache extract /tmp/ipsw.zip -o /tmp/kernel_out 2>&1 || echo "ipsw kernelcache extract failed"
-          ls -lh /tmp/kernel_out/ || true
+          echo ""
+          echo "=== Attempt 1: ipsw extract --kernel --lookup (cryptex + theapplewiki keys) ==="
+          ipsw extract -k -l /tmp/ipsw.zip -o /tmp/kernel_out 2>&1 | tail -25 || echo "[-] ipsw extract --kernel failed"
+          echo ""
+          echo "=== Extracted files ==="
+          find /tmp/kernel_out -type f -exec ls -lh {} \; 2>/dev/null || true
+          echo ""
+          echo "=== Attempt 2 (fallback): manual unzip of top-level kernelcache ==="
+          if [ -z "$(find /tmp/kernel_out -type f 2>/dev/null)" ]; then
+            unzip -o -j /tmp/ipsw.zip "kernelcache*" -d /tmp/kernel_out 2>&1 | tail -5 || true
+            find /tmp/kernel_out -type f -exec ls -lh {} \; 2>/dev/null || true
+          fi
 
       - name: Free disk space
         run: |
@@ -98,15 +105,33 @@ jobs:
 
       - name: Analyze AppleJPEGDriver dispatch table
         run: |
-          KC=$(find /tmp/kernel_out -name "kernelcache*" -type f 2>/dev/null | head -1)
-          if [ -z "$KC" ]; then KC=$(find /tmp -name "kernelcache*" -type f 2>/dev/null | head -1); fi
+          KC=$(find /tmp/kernel_out -name "*kernelcache*" -type f 2>/dev/null | head -1)
+          if [ -z "$KC" ]; then KC=$(find /tmp -maxdepth 3 -name "*kernelcache*" -type f 2>/dev/null | head -1); fi
           echo "kernelcache found: $KC"
           if [ -n "$KC" ]; then
             file "$KC"
-            cp "$KC" /tmp/kernelcache.macho
-            python3 tools/analyze_jpeg_dispatch.py /tmp/kernelcache.macho | tee jpeg_dispatch_analysis.txt
+            cp "$KC" /tmp/kernelcache.raw
+            # If still IMG4/compressed, decode it
+            FT=$(file -b "$KC")
+            echo "file type: $FT"
+            if [[ "$FT" == *"Mach-O"* ]]; then
+              cp "$KC" /tmp/kernelcache.macho
+            else
+              echo "[*] Not a plain Mach-O - attempting decompress/decrypt..."
+              ipsw kernel dec "$KC" -o /tmp/kernelcache.macho 2>&1 | tail -5 || true
+              if [ ! -s /tmp/kernelcache.macho ]; then
+                ipsw img4 dec "$KC" -o /tmp/kernelcache.macho 2>&1 | tail -5 || true
+              fi
+            fi
+            if [ -s /tmp/kernelcache.macho ]; then
+              file /tmp/kernelcache.macho
+              python3 tools/analyze_jpeg_dispatch.py /tmp/kernelcache.macho | tee jpeg_dispatch_analysis.txt
+            else
+              echo "[-] Could not produce a Mach-O kernelcache"
+              exit 1
+            fi
           else
-            echo "[-] No kernelcache extracted - investigating IPSW structure"
+            echo "[-] No kernelcache extracted"
             exit 1
           fi
 
