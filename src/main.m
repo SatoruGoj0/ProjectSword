@@ -1784,21 +1784,21 @@ bool install_bootstrap(void) {
     snprintf(tar_candidates[nc++], sizeof(tar_candidates[0]), "/usr/bin/tar");
     snprintf(tar_candidates[nc++], sizeof(tar_candidates[0]), "%s/tar", self_path);
     snprintf(tar_candidates[nc++], sizeof(tar_candidates[0]), "/var/jb/usr/bin/tar");
-    char tar_path[4096] = "";
+    char tar_bin[4096] = "";
     for (int i = 0; i < nc; i++) {
         if (stat(tar_candidates[i], &st) == 0) {
-            snprintf(tar_path, sizeof(tar_path), "%s", tar_candidates[i]);
+            snprintf(tar_bin, sizeof(tar_bin), "%s", tar_candidates[i]);
             break;
         }
     }
-    if (tar_path[0] == 0) {
+    if (tar_bin[0] == 0) {
         printf("[-] No usable tar binary found\n");
         return false;
     }
-    printf("[*] Using tar: %s\n", tar_path);
+    printf("[*] Using tar: %s\n", tar_bin);
 
     const char *argv[] = {
-        tar_path,
+        tar_bin,
         "--preserve-permissions",
         "-xkf",
         tar_path,
@@ -1808,7 +1808,7 @@ bool install_bootstrap(void) {
     };
 
     pid_t pid;
-    int ret = posix_spawnp(&pid, tar_path, NULL, NULL,
+    int ret = posix_spawnp(&pid, tar_bin, NULL, NULL,
         (char *const *)argv, NULL);
     if (ret != 0) {
         printf("[-] tar spawn: %s\n", strerror(ret));
