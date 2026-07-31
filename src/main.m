@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <mach-o/dyld.h>
 #include <sys/utsname.h>
 #include <sys/socket.h>
