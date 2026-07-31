@@ -68,6 +68,7 @@ jobs:
 
       - name: Install tools
         run: |
+          brew trust blacktop/tap
           brew install blacktop/tap/ipsw
           python3 -m pip install --upgrade pip
           python3 -m pip install pyimg4 requests
