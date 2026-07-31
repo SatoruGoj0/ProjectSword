@@ -37,19 +37,20 @@
 // ===== Kernel base (cached) =====
 #define KERNEL_BASE_DEFAULT 0xfffffff007004000ULL
 
-// ===== Proc struct offsets (xnu-11215 arm64e) =====
-// These may need verification on-device via kernel memory scanning
-#define OFFSET_P_PID    0x68   // proc->p_pid
-#define OFFSET_P_TASK   0x10   // proc->task
-#define OFFSET_P_UCRED  0xF0   // proc->p_ucred (BEST GUESS - VERIFY)
-#define OFFSET_P_UID    0x60   // proc->p_uid (cached uid, MAY VARY)
+// ===== Proc/thread struct offsets (iOS 18.2.x / A14, wh1te4ever darksword-kexploit-fun) =====
+// Chain: inpcb(0x40) -> socket -> so_background_thread -> thread -> t_tro -> thread_ro -> proc
+#define OFFSET_SOCKET_BACKGROUND_THREAD 0x2b0  // socket->so_background_thread (18.0-18.7)
+#define OFFSET_THREAD_T_TRO             0x380  // thread->t_tro (A13+/A14, iOS 18.1-18.3)
+#define OFFSET_THREAD_RO_PROC           0x18   // thread_ro->tro_proc
+#define OFFSET_THREAD_RO_TASK           0x28   // thread_ro->tro_task
 
-// UID/GID fields in proc (adjacent, 4 bytes each)
-#define OFFSET_P_RUID   (OFFSET_P_UID + 4)
-#define OFFSET_P_SVUID  (OFFSET_P_UID + 8)
+#define OFFSET_P_PID       0x60   // proc->p_pid (18.0-18.7)
+#define OFFSET_P_PROC_RO   0x18   // proc->p_proc_ro
+#define OFFSET_PROC_RO_TASK    0x8   // proc_ro->pr_task
+#define OFFSET_PROC_RO_UCRED   0x20  // proc_ro->p_ucred (18.0-18.3.x)
 
 // ===== Task struct offsets =====
-#define OFFSET_TASK_T_FLAGS  0x3DC  // task->t_flags
+#define OFFSET_TASK_T_FLAGS  0x3DC  // fallback; auto-detected at runtime
 #define TF_PLATFORM          0x400  // task is platform binary
 
 // ===== Ucred struct offsets (BEST GUESS - VERIFY ON DEVICE) =====

