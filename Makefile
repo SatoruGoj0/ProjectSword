@@ -54,6 +54,7 @@ ipa: $(TARGET)
 	cp $(TARGET) Payload/ProjectSword.app/
 	cp Info.plist Payload/ProjectSword.app/
 	cp $(ENTITLEMENTS_FILE) Payload/ProjectSword.app/
+	if [ -f version.txt ]; then cp version.txt Payload/ProjectSword.app/; fi
 	if [ -f bootstrap.tar ]; then cp bootstrap.tar Payload/ProjectSword.app/; fi
 	if [ -f sileo.deb ]; then cp sileo.deb Payload/ProjectSword.app/; fi
 ifneq ($(SIGN),0)
