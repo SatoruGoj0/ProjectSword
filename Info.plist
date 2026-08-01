@@ -36,5 +36,9 @@
 	<false/>
 	<key>MinimumOSVersion</key>
 	<string>18.0</string>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 </dict>
 </plist>
