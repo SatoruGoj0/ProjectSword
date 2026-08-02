@@ -193,6 +193,13 @@ IOSurfaceRef create_surface_with_address(uint64_t address, uint64_t size) {
     return surface;
 }
 
+// Forward decls needed by functions that call helpers defined below.
+uint64_t find_proc_by_pid(uint32_t pid);
+uint64_t find_our_proc(void);
+uint64_t get_task_from_proc(uint64_t proc);
+uint64_t get_ucred_from_proc(uint64_t proc);
+bool platformize_proc(void);
+
 void surface_mlock(uint64_t address, uint64_t size) {
     gMlockDict[@(address)] = (__bridge id)create_surface_with_address(address, size);
 }
