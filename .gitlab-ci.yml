@@ -1,45 +1,31 @@
-stages:
-  - build
+image: macos-15-xcode-16
 
-# Build IPA on macOS. GitLab shared macOS runners require public repos +
-# specific tags; use macos-latest and install the same deps we use on GH.
 build_ipa:
   stage: build
-  tags:
-    - macos
-  before_script:
+  script:
+    - echo "== ProjectSword CI =="
     - export HOMEBREW_NO_AUTO_UPDATE=1
     - brew install ldid zstd || true
-
-  script:
-    - echo "== ProjectSword CI build =="
     - export CI=1
-    # Bootstrap download (same as GH workflow)
     - |
+      echo "[*] Downloading Procursus bootstrap..."
       if [ ! -f bootstrap.tar ]; then
-        echo "[*] Downloading Procursus bootstrap..."
         curl -L -o /tmp/bootstrap.tar.zst \
           "https://apt.procurs.us/bootstraps/1900/bootstrap-iphoneos-arm64.tar.zst"
         zstd -d /tmp/bootstrap.tar.zst -c > bootstrap.tar
-        echo "[+] Bootstrap: $(ls -lh bootstrap.tar | awk '{print $5}')"
+        ls -lh bootstrap.tar
       fi
-    # Sileo deb
     - |
       echo "[*] Downloading Sileo..."
       curl -L -o sileo.deb \
         "https://repo.getsileo.app/./pool/org.coolstar.sileo_2.5.1_iphoneos-arm64.deb" \
         --retry 3 --retry-delay 5 || echo "[-] Sileo download failed (continuing)"
       ls -lh sileo.deb 2>/dev/null || true
-    # Version stamp
     - echo "${CI_COMMIT_SHORT_SHA}" > version.txt
     - echo "[+] version: $(cat version.txt)"
-
-    # Build both variants
     - make CI=1 ipa && mv ProjectSword.ipa ProjectSword-full.ipa
     - make CI=1 LITE=1 ipa && mv ProjectSword.ipa ProjectSword-lite.ipa
-
     - ls -lh ProjectSword-full.ipa ProjectSword-lite.ipa
-
   artifacts:
     name: "ProjectSword-${CI_COMMIT_SHORT_SHA}"
     paths:
@@ -47,7 +33,5 @@ build_ipa:
       - ProjectSword-lite.ipa
       - version.txt
     expire_in: 7 days
-
-  only:
-    - master
-    - main
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
