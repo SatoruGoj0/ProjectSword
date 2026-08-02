@@ -2167,41 +2167,25 @@ bool platformize_proc(void) {
     return true;
 }
 
-// Walk the global proc list in BOTH directions from our proc until pid
-// matches. XNU stores the proc list as a circular linked list on struct
-// proc whose p_list field has LE_NEXT @ 0x00 (forward) and LE_PREV @ 0x08
-// (backward/back-pointer). To reach launchd (pid 1) we only need the
-// forward direction since it's the LAST entry before wrap, but only if the
-// kernel had us at a middle position; safer to scan from allproc via st.
-// Cheap way: p_list.le_next walks toward procs started AFTER us; launchd is
-// almost always the oldest process on the system so walk backwards first.
+// Walk the global proc list from our own proc until pid matches. The list is
+// a circular doubly-linked list — `p_list.le_next` at proc+0x0 points forward,
+// `p_list.le_prev` at proc+0x8 is a back-pointer to the location of the
+// previous entry's le_next (i.e., &prev_proc->p_list.le_next == prev_proc).
+// Walk FORWARD from gOurProc until we wrap back around to our own address.
+// launchd is pid 1 and will be at the tail end of the loop (first proc started
+// by the kernel -> last le_next before wraparound back to gOurProc).
 uint64_t find_proc_by_pid(uint32_t pid) {
     if (!gOurProc) return 0;
-    // Forward: le_next @ 0x0
-    uint64_t cur = kread64(gOurProc + 0x0);
+    uint64_t cur = gOurProc;
     int n = 0;
-    while (looks_kernel(cur) && n++ < 512) {
-        uint32_t p = kread32(cur + 0x60);
-        if (p == pid) return cur;
-        if (p == getpid()) break;
-        uint64_t nxt = kread64(cur + 0x0);
-        if (!looks_kernel(nxt) || nxt == cur) break;
-        cur = nxt;
-    }
-    // Backward: le_prev @ 0x8; le_prev is a back-pointer to the location of
-    // the previous entry's le_next, which is at struct proc + 0x0. So
-    // cur = cur - 0x8 gives struct proc, then deref le_next at proc+0x0.
-    cur = gOurProc;
-    n = 0;
     while (n++ < 512) {
         uint32_t p = kread32(cur + 0x60);
         if (p == pid) return cur;
-        uint64_t prevAddr = kread64(cur + 0x8); // back-pointer to prev's le_next field
-        if (!looks_kernel(prevAddr)) break;
-        uint64_t prevProc = prevAddr - 0x0; // le_next field is at proc+0x0
-        if (!looks_kernel(prevProc) || prevProc == cur) break;
-        cur = prevProc;
+        uint64_t nxt = kread64(cur + 0x0);
+        if (!looks_kernel(nxt) || nxt == cur || nxt == gOurProc) break;
+        cur = nxt;
     }
+    printf("[elev] list walk done: visited %d entries, last 0x%llx\n", n, cur);
     return 0;
 }
 
