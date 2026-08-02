@@ -239,11 +239,14 @@ void log_printf(NSString *format, ...) {
 - (void)exportLog {
     NSString *p = ps_doc_path(@"ps.log");
     NSString *s = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
-    if (!s) s = @"(no ps.log yet)";
+    if (!s) s = @"(no ps.log yet — tap JAILBREAK first to generate it)";
     UIPasteboard.generalPasteboard.string = s;
-    self.logView.text = [self.logView.text stringByAppendingString:
-        [NSString stringWithFormat:@"[+] ps.log (%lu chars) copied to clipboard — paste anywhere to share.\n",
-            (unsigned long)s.length]];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.logView.text = @"";
+        self.logView.text = [s hasPrefix:@"(no ps.log"] ? s : [s substringFromIndex:MAX(0,(NSInteger)s.length - 4096)];
+        self.startButton.enabled = YES;
+        self.statusLabel.text = @"Log copied to clipboard";
+    });
 }
 
 - (void)startExploit {
