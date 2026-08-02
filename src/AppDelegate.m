@@ -219,10 +219,31 @@ void log_printf(NSString *format, ...) {
     foot.textAlignment = NSTextAlignmentCenter;
     [vc.view addSubview:foot];
 
+    // Export-full-log button (writes Documents/ps.log contents to clipboard,
+    // which the user can paste into any pastebin/message after a failed JB).
+    UIButton *exp = [[UIButton alloc] initWithFrame:CGRectMake(w - pad - 110, 32, 110, 34)];
+    [exp setTitle:@"EXPORT LOG" forState:UIControlStateNormal];
+    [exp setTitleColor:PS_INK forState:UIControlStateNormal];
+    exp.titleLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightSemibold];
+    exp.backgroundColor = PS_ACCENT;
+    exp.layer.cornerRadius = 10;
+    [exp addTarget:self action:@selector(exportLog) forControlEvents:UIControlEventTouchUpInside];
+    [vc.view addSubview:exp];
+
     [self.window makeKeyAndVisible];
 
     log_printf(@"ProjectSword v%@ loaded. Tap JAILBREAK to begin.\n", self.appVersionString);
     return YES;
+}
+
+- (void)exportLog {
+    NSString *p = ps_doc_path(@"ps.log");
+    NSString *s = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+    if (!s) s = @"(no ps.log yet)";
+    UIPasteboard.generalPasteboard.string = s;
+    self.logView.text = [self.logView.text stringByAppendingString:
+        [NSString stringWithFormat:@"[+] ps.log (%lu chars) copied to clipboard — paste anywhere to share.\n",
+            (unsigned long)s.length]];
 }
 
 - (void)startExploit {
