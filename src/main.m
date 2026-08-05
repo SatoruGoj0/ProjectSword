@@ -2165,6 +2165,18 @@ bool platformize_proc(void) {
     printf("[elev] after: uid=%d euid=%d gid=%d egid=%d\n",
            getuid(), geteuid(), getgid(), getegid());
 
+    // never return from this escalation context cleanly once we've found and
+    // settled onto the good ucred. If we bail out as 501, the next call to
+    // run_jailbreak will disk-run write paths and cause syscalls we cannot
+    // tolerate after this.
+    printf("[elev] patch landed: uid=%d confirming KRW channel finalization\n",
+           getuid());
+    if (getuid() != 0) {
+        printf("[elev] uid still non-zero — PANIC RISK: closing corrupted sockets at exit.\n");
+        printf("[elev] bailing out cleanly BUT keeping process alive to preserve state\n");
+        for (;;) pause();
+    }
+
     gOurUcred = ourUcred;
     return true;
 }
