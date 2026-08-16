@@ -83,6 +83,21 @@
 // ===== MAC label offsets =====
 #define OFFSET_LABEL_SANDBOX  0x10  // label slots[0] or slots[1]
 
+// ===== Vnode / filedesc / APFS offsets (lara offsets.m, PROVEN 17.0-18.7.1) =====
+#define OFF_P_FD            0xd0   // proc->p_fd (or inline filedesc base)
+#define OFF_FDESC_OFILES_A  0x28   // lara/kfd filedesc->fd_ofiles
+#define OFF_FDESC_OFILES_B  0x20   // Dopamine ofiles_start variant
+#define OFF_FDESC_CDIR_A    0x48   // filedesc->fd_cdir
+#define OFF_FILEPROC_GLOB   0x10   // fileproc->fp_glob
+#define OFF_FILEGLOB_DATA   0x38   // fileglob->fg_data (vnode)
+#define OFF_VNODE_V_DATA    0xe0   // vnode->v_data (apfs fsnode)
+// apfs_fsnode field offsets (offsetof of lara's struct apfs_fsnode)
+#define OFF_FSNODE_UID      0x80
+#define OFF_FSNODE_GID      0x84
+#define OFF_FSNODE_MODE     0x88
+
+bool kern_own(const char *path, uint32_t uid, uint32_t gid, int mode);
+
 // ===== Global variables (set by exploit at runtime) =====
 extern uint64_t gOurProc;
 extern uint64_t gKernelProc;

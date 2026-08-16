@@ -44,6 +44,20 @@ jobs:
             --retry 3 --retry-delay 5 || echo "[-] Sileo download failed (build continues)"
           ls -lh sileo.deb 2>/dev/null || echo "[-] No sileo.deb"
 
+      - name: Extract sileo.tar from deb (on-device dpkg/xz impossible without trust cache)
+        run: |
+          if [ -f sileo.deb ]; then
+            mkdir -p sileo-extract && cd sileo-extract
+            ar x ../sileo.deb || echo "[-] ar failed"
+            if [ -f data.tar.xz ]; then
+              tar -xJf data.tar.xz || echo "[-] tar extract failed"
+              tar -cf ../sileo.tar . && echo "[+] sileo.tar created ($(ls -lh ../sileo.tar | awk '{print $5}'))"
+            else
+              echo "[-] data.tar.xz not found in sileo.deb"
+            fi
+            cd .. && rm -rf sileo-extract
+          fi
+
       - name: Stamp build version
         run: |
           echo "${GITHUB_SHA::7}" > version.txt

