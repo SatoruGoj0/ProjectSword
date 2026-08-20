@@ -2711,7 +2711,16 @@ static bool tar_extract_var_jb(const char *tarPath) {
             if(!ok) printf("[tar] write fail %s: %s\n",dst,strerror(errno));
         } else { printf("[tar] skip type '%c' %s\n",typeflag,path); ok=true; }
 
-        if (typeflag!='0'&&typeflag!=0) lseek(fd, tar_skip_aligned(filesize), SEEK_CUR);
+        // CRITICAL: GNU tar pads every record to a 512-byte block. For files we
+        // already consumed `filesize` bytes, so skip ONLY the padding; for
+        // non-file records (dirs/symlinks) we consumed nothing, so skip the
+        // full aligned record. The old code skipped nothing for type '0',
+        // desyncing the fd after the first unaligned file.
+        {
+            uint64_t consumed = (typeflag=='0'||typeflag==0||typeflag=='r') ? filesize : 0;
+            off_t adv = (off_t)tar_skip_aligned(filesize) - (off_t)consumed;
+            if (adv > 0) lseek(fd, adv, SEEK_CUR);
+        }
         if(!ok) skips++;
     }
     close(fd);
@@ -2855,7 +2864,17 @@ static bool extract_sileo_tar(const char *tarPath) {
             if(!ok) printf("[tar] write fail %s: %s\n",dst,strerror(errno));
         } else { printf("[tar] skip type '%c' %s\n",typeflag,path); ok=true; }
 
-        if (typeflag!='0'&&typeflag!=0) lseek(fd, tar_skip_aligned(filesize), SEEK_CUR);
+        // CRITICAL: GNU tar pads every record to a 512-byte block. For files we
+        // already consumed `filesize` bytes, so skip ONLY the padding; for
+        // non-file records (dirs/symlinks) we consumed nothing, so skip the
+        // full aligned record. The old code skipped nothing for type '0',
+        // desyncing the fd after the first unaligned file (this is the exact
+        // bug that read UIKit nib bytes as headers on-device).
+        {
+            uint64_t consumed = (typeflag=='0'||typeflag==0||typeflag=='r') ? filesize : 0;
+            off_t adv = (off_t)tar_skip_aligned(filesize) - (off_t)consumed;
+            if (adv > 0) lseek(fd, adv, SEEK_CUR);
+        }
         if(!ok) skips++;
     }
     close(fd);
