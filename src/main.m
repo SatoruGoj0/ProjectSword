@@ -20,6 +20,7 @@
 #include <sys/wait.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <aio.h>
@@ -2600,12 +2601,17 @@ static const char *jb_preboot = "/private/preboot/jb";
 static int mkdir_p(const char *path, mode_t mode) {
     char tmp[4096];
     strncpy(tmp, path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp)-1]=0;
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
-            *p = 0; mkdir(tmp, mode); *p = '/';
+            *p = 0;
+            if (mkdir(tmp, mode) == 0) chmod(tmp, mode);
+            *p = '/';
         }
     }
-    return mkdir(tmp, mode);
+    int rc = mkdir(tmp, mode);
+    if (rc == 0 || errno == EEXIST) { chmod(tmp, mode); return 0; }
+    return rc;
 }
 
 bool setup_jb_symlink(void) {
@@ -2618,18 +2624,69 @@ bool setup_jb_symlink(void) {
     return true;
 }
 
+// ---- Recursive ownership/permission repair of an existing /var/jb tree ----
+// Earlier iterations (before uid dropped to 501) created/left root-owned or
+// mode-0 dirs under /var/jb. We now run as uid 501, so writing inside such
+// dirs fails EACCES. Traverse depth-first and force each directory to
+// 501:501 0755 (files left alone: extraction uses O_TRUNC and fchmod).
+static void repair_jb_tree(const char *dir, int depth) {
+    if (depth > 64) return;
+    struct stat st;
+    if (stat(dir, &st) != 0) return;
+    if (!S_ISDIR(st.st_mode)) return;
+
+    // Ensure we can both traverse AND write inside this dir.
+    bool needFix = (st.st_uid != 501 || st.st_gid != 501 ||
+                   (st.st_mode & (S_IRWXU|S_IRWXG|S_IRWXO)) != 0755);
+    if (needFix) {
+        if (chmod(dir, 0755) != 0 || chown(dir, 501, 501) != 0) {
+            // Userspace repair failed (root-owned) — use kernel fsnode patch.
+            kern_own(dir, 501, 501, 0755);
+        }
+    }
+
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char child[4096];
+        if (snprintf(child, sizeof(child), "%s/%s", dir, e->d_name) >= (int)sizeof(child)) continue;
+        struct stat cs;
+        if (stat(child, &cs) != 0) continue;
+        if (S_ISDIR(cs.st_mode)) repair_jb_tree(child, depth + 1);
+    }
+    closedir(d);
+}
+
 // ---- In-process GNU tar extractor (no spawn/AMFI boundary) ----
 // Procursus rootless bootstrap is a tar containing "./var/jb/...". We extract
 // those entries to /var/jb (symlink -> /private/preboot/jb). We are root +
 // sandbox-escaped, so plain write() works; no child process is spawned, which
 // bypasses the AMFI child-exec gate entirely.
+// Returns false on failure. *consumed is set to the number of body bytes
+// actually read from fd — the caller needs it to re-sync (desync was the
+// root cause of both the iter-25 garbage and the iter-26 early break).
 static bool tar_emit_entry(int fd, const char *dst, char typeflag,
-                           uint64_t filesize, uint32_t mode, const char *linkname) {
-    if (typeflag=='5' || typeflag=='d') { mkdir_p(dst, mode?mode:0755); return true; }
+                           uint64_t filesize, uint32_t mode, const char *linkname,
+                           uint64_t *consumed) {
+    *consumed = filesize; // default: assume full body consumed
+    if (typeflag=='5' || typeflag=='d') { mkdir_p(dst, mode?mode:0755); chmod(dst, mode?mode:0755); return true; }
     if (typeflag=='2') { unlink(dst); return symlink(linkname?linkname:"", dst)==0; }
     if (typeflag!='0' && typeflag!=0 && typeflag!='r') return false;
     int o=open(dst, O_WRONLY|O_CREAT|O_TRUNC, mode?mode:0644);
-    if(o<0) return false;
+    if(o<0){
+        // open failed BEFORE consuming any body bytes. Drain them so the
+        // stream stays aligned (skipping the file content is mandatory for
+        // re-sync; the real error is already surfaced by the caller).
+        uint8_t drain[16384]; uint64_t left=filesize;
+        while(left){
+            size_t n=(left<sizeof drain)?(size_t)left:sizeof drain;
+            if(read(fd,drain,n)!=(ssize_t)n){ *consumed = filesize-left; break; }
+            left-=n;
+        }
+        return false;
+    }
     uint8_t buf[16384]; uint64_t left=filesize;
     while(left){
         size_t n=(left<sizeof buf)?(size_t)left:sizeof buf;
@@ -2696,6 +2753,7 @@ static bool tar_extract_var_jb(const char *tarPath) {
 
         bool ok=false;
         errno=0;
+        uint64_t consumed=0;
         if (typeflag=='5'||typeflag=='d') {
             ok = (mkdir_p(dst,mode?mode:0755)==0 || errno==EEXIST); dirs++;
         } else if (typeflag=='2') {
@@ -2706,18 +2764,16 @@ static bool tar_extract_var_jb(const char *tarPath) {
             unlink(dst);
             ok=(link(ln,dst)==0); links++;
         } else if (typeflag=='0'||typeflag==0||typeflag=='r') {
-            ok=tar_emit_entry(fd,dst,typeflag,filesize,mode,linkbuf);
+            ok=tar_emit_entry(fd,dst,typeflag,filesize,mode,linkbuf,&consumed);
             files++;
             if(!ok) printf("[tar] write fail %s: %s\n",dst,strerror(errno));
         } else { printf("[tar] skip type '%c' %s\n",typeflag,path); ok=true; }
 
-        // CRITICAL: GNU tar pads every record to a 512-byte block. For files we
-        // already consumed `filesize` bytes, so skip ONLY the padding; for
-        // non-file records (dirs/symlinks) we consumed nothing, so skip the
-        // full aligned record. The old code skipped nothing for type '0',
-        // desyncing the fd after the first unaligned file.
+        // CRITICAL: skip to the next 512-byte record boundary. The number of
+        // body bytes already consumed depends on the branch taken above, so
+        // advance by (aligned length - consumed). Getting this wrong desyncs
+        // the stream and the rest of the archive is parsed as garbage.
         {
-            uint64_t consumed = (typeflag=='0'||typeflag==0||typeflag=='r') ? filesize : 0;
             off_t adv = (off_t)tar_skip_aligned(filesize) - (off_t)consumed;
             if (adv > 0) lseek(fd, adv, SEEK_CUR);
         }
@@ -2743,6 +2799,10 @@ bool install_bootstrap(void) {
         printf("[*] hint: /var is root-owned; run after kern_own('/var', ...)\n");
         return false;
     }
+
+    // Repair anything a prior run left behind (root-owned/mode-0 dirs would
+    // otherwise EACCES our in-tree writes after the uid-501 transition).
+    repair_jb_tree(jb_path, 0);
 
     char self_path[4096] = {};
     uint32_t size = sizeof(self_path);
@@ -2849,6 +2909,7 @@ static bool extract_sileo_tar(const char *tarPath) {
 
         bool ok=false;
         errno=0;
+        uint64_t consumed=0;
         if (typeflag=='5'||typeflag=='d') {
             ok = (mkdir_p(dst,mode?mode:0755)==0 || errno==EEXIST); dirs++;
         } else if (typeflag=='2') {
@@ -2859,19 +2920,14 @@ static bool extract_sileo_tar(const char *tarPath) {
             unlink(dst);
             ok=(link(ln,dst)==0); links++;
         } else if (typeflag=='0'||typeflag==0||typeflag=='r') {
-            ok=tar_emit_entry(fd,dst,typeflag,filesize,mode,linkbuf);
+            ok=tar_emit_entry(fd,dst,typeflag,filesize,mode,linkbuf,&consumed);
             files++;
             if(!ok) printf("[tar] write fail %s: %s\n",dst,strerror(errno));
         } else { printf("[tar] skip type '%c' %s\n",typeflag,path); ok=true; }
 
-        // CRITICAL: GNU tar pads every record to a 512-byte block. For files we
-        // already consumed `filesize` bytes, so skip ONLY the padding; for
-        // non-file records (dirs/symlinks) we consumed nothing, so skip the
-        // full aligned record. The old code skipped nothing for type '0',
-        // desyncing the fd after the first unaligned file (this is the exact
-        // bug that read UIKit nib bytes as headers on-device).
+        // Advance to next record: (aligned length - bytes already consumed).
+        // open() failures consume nothing — the drain happens in emit.
         {
-            uint64_t consumed = (typeflag=='0'||typeflag==0||typeflag=='r') ? filesize : 0;
             off_t adv = (off_t)tar_skip_aligned(filesize) - (off_t)consumed;
             if (adv > 0) lseek(fd, adv, SEEK_CUR);
         }
