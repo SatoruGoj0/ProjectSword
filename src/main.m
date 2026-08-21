@@ -2614,6 +2614,58 @@ static int mkdir_p(const char *path, mode_t mode) {
     return rc;
 }
 
+// Drop any pre-existing regular file/dir at `path`, then clear its parent.
+// The iter-27 run proved the parent dirs are 501-owned after repair, so
+// unlink() usually succeeds on its own; if anything is pinned by a wrong
+// owner, the kernel fsnode patch clears it. Directories get a fast recursive
+// purge first (bounded depth).
+static void clear_path(const char *path, int depth);
+static void clear_tree(const char *dir, int depth) {
+    if (depth > 12) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char child[4096];
+        if (snprintf(child, sizeof(child), "%s/%s", dir, e->d_name) >= (int)sizeof(child)) continue;
+        clear_path(child, depth + 1);
+    }
+    closedir(d);
+}
+static void clear_path(const char *path, int depth) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        // ENOENT unless it's a dangling symlink — remove that if present.
+        if (lstat(path, &st) == 0) unlink(path);
+        return;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        if (st.st_uid != 501 || !(st.st_mode & S_IRWXU)) {
+            // must descend into it first while we still can
+            kern_own(path, 501, 501, 0755);
+        }
+        clear_tree(path, depth);
+        if (rmdir(path) != 0) {
+            kern_own(path, 501, 501, 0755);
+            rmdir(path);
+        }
+    } else {
+        if (unlink(path) != 0) {
+            kern_own(path, 501, 501, 0644);
+            unlink(path);
+        }
+    }
+}
+static void parent_writable(const char *dst) {
+    char parent[4096]; snprintf(parent,sizeof(parent),"%s",dst);
+    char *sl=strrchr(parent,'/'); if(!sl) return; *sl=0;
+    struct stat ps;
+    if (stat(parent, &ps) == 0 && ps.st_uid == 501 && (ps.st_mode & S_IWUSR)) return;
+    chmod(parent, 0755); chown(parent, 501, 501);
+    if (stat(parent, &ps) == 0 && !(ps.st_mode & S_IWUSR)) kern_own(parent, 501, 501, 0755);
+}
+
 bool setup_jb_symlink(void) {
     unlink(jb_var);
     if (symlink(jb_path, jb_var) != 0) {
@@ -2672,9 +2724,23 @@ static bool tar_emit_entry(int fd, const char *dst, char typeflag,
                            uint64_t *consumed) {
     *consumed = filesize; // default: assume full body consumed
     if (typeflag=='5' || typeflag=='d') { mkdir_p(dst, mode?mode:0755); chmod(dst, mode?mode:0755); return true; }
-    if (typeflag=='2') { unlink(dst); return symlink(linkname?linkname:"", dst)==0; }
+    if (typeflag=='2') { // symlink
+        bool ok = (unlink(dst)==0 || errno==ENOENT) && symlink(linkname?linkname:"", dst)==0;
+        if (!ok) { clear_path(dst, 0); parent_writable(dst); ok = symlink(linkname?linkname:"", dst)==0; }
+        return ok;
+    }
     if (typeflag!='0' && typeflag!=0 && typeflag!='r') return false;
+    // Remove a prior file first: iter-27 left root-owned files (bashbug,
+    // sudoers, THANKS.zst) that parent-dir repair cannot fix — only the
+    // FILES themselves blocked open(O_TRUNC). unlink needs only write perm
+    // on the parent dir, which repair already guarantees 501-owned.
+    unlink(dst);
     int o=open(dst, O_WRONLY|O_CREAT|O_TRUNC, mode?mode:0644);
+    if(o<0){
+        // Last-chance cleanup and one retry before giving up the body.
+        clear_path(dst, 0); parent_writable(dst);
+        o=open(dst, O_WRONLY|O_CREAT|O_TRUNC, mode?mode:0644);
+    }
     if(o<0){
         // open failed BEFORE consuming any body bytes. Drain them so the
         // stream stays aligned (skipping the file content is mandatory for
@@ -2758,11 +2824,15 @@ static bool tar_extract_var_jb(const char *tarPath) {
             ok = (mkdir_p(dst,mode?mode:0755)==0 || errno==EEXIST); dirs++;
         } else if (typeflag=='2') {
             unlink(dst);
-            ok = (symlink(linkbuf,dst)==0); links++;
+            ok = (symlink(linkbuf,dst)==0);
+            if(!ok){ clear_path(dst,0); parent_writable(dst); ok=(symlink(linkbuf,dst)==0); }
+            links++;
         } else if (typeflag=='1') {
             char ln[4096]; snprintf(ln,sizeof(ln),"%s/%s",jb_path,linkbuf);
             unlink(dst);
-            ok=(link(ln,dst)==0); links++;
+            ok=(link(ln,dst)==0);
+            if(!ok){ clear_path(dst,0); parent_writable(dst); ok=(link(ln,dst)==0); }
+            links++;
         } else if (typeflag=='0'||typeflag==0||typeflag=='r') {
             ok=tar_emit_entry(fd,dst,typeflag,filesize,mode,linkbuf,&consumed);
             files++;
@@ -2914,11 +2984,15 @@ static bool extract_sileo_tar(const char *tarPath) {
             ok = (mkdir_p(dst,mode?mode:0755)==0 || errno==EEXIST); dirs++;
         } else if (typeflag=='2') {
             unlink(dst);
-            ok = (symlink(linkbuf,dst)==0); links++;
+            ok = (symlink(linkbuf,dst)==0);
+            if(!ok){ clear_path(dst,0); parent_writable(dst); ok=(symlink(linkbuf,dst)==0); }
+            links++;
         } else if (typeflag=='1') {
             char ln[4096]; snprintf(ln,sizeof(ln),"%s/%s",jb_path,linkbuf);
             unlink(dst);
-            ok=(link(ln,dst)==0); links++;
+            ok=(link(ln,dst)==0);
+            if(!ok){ clear_path(dst,0); parent_writable(dst); ok=(link(ln,dst)==0); }
+            links++;
         } else if (typeflag=='0'||typeflag==0||typeflag=='r') {
             ok=tar_emit_entry(fd,dst,typeflag,filesize,mode,linkbuf,&consumed);
             files++;
@@ -2944,12 +3018,6 @@ bool install_sileo(void) {
     snprintf(sileo_path, sizeof(sileo_path), "%s/Applications/Sileo.app", jb_path);
     struct stat st;
 
-    // If Sileo is already installed, skip straight to registration.
-    if (stat(sileo_path, &st) == 0) {
-        printf("[*] Sileo.app already present\n");
-        goto uicache_step;
-    }
-
     char self_path[4096] = {};
     uint32_t size = sizeof(self_path);
     if (_NSGetExecutablePath(self_path, &size) != 0) return false;
@@ -2958,16 +3026,27 @@ bool install_sileo(void) {
     *slash = 0;
 
     // Preferred: pre-extracted sileo.tar (CI produces it from sileo.deb).
+    // NOTE: never skip on "already present" — the on-disk Sileo.app from
+    // earlier runs is root-owned garbage; purge and re-extract every time.
     char star[4096];
     snprintf(star, sizeof(star), "%s/sileo.tar", self_path);
     if (stat(star, &st) == 0) {
+        char apps_dir[4096];
+        snprintf(apps_dir, sizeof(apps_dir), "%s/Applications", jb_path);
+        mkdir_p(apps_dir, 0755);
+        if (stat(sileo_path, &st) == 0) {
+            printf("[*] Purging stale Sileo.app\n");
+            clear_path(sileo_path, 0);
+        }
         printf("[*] Installing Sileo from %s (in-process, no AMFI spawn)\n", star);
         if (!extract_sileo_tar(star)) {
             printf("[-] sileo.tar extraction failed\n");
             return false;
         }
+    } else if (stat(sileo_path, &st) == 0) {
+        printf("[*] Sileo.app already present\n");
     } else {
-        printf("[-] sileo.tar not bundled; dpkg path unavailable (no trust cache)\n");
+        printf("[-] sileo.tar not bundled and no Sileo.app on disk\n");
     }
 
     if (stat(sileo_path, &st) != 0) {
@@ -2975,7 +3054,6 @@ bool install_sileo(void) {
         return false;
     }
 
-uicache_step:
     // uicache/lsregister needs a platform binary executor or trust cache —
     // without TC injection it will EPERM. Report but don't fail the phase:
     // Sileo can be launched manually once it's on disk.
