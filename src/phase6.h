@@ -24,7 +24,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-extern uint64_t gOurProc, gOurTask, gKernelBase, gKernelSlide;
+// KRW primitives + globals come from offsets.h (used by both main.m and
+// phase6.m). phase6.m itself also includes offsets.h directly; the guard
+// makes double-inclusion harmless.
+#ifndef OFFSETS_H
+#include "offsets.h"
+#endif
 
 // kernel static base for iPhone13,2 18.x
 #define KERN_STATIC_BASE            0xfffffff007004000ULL
@@ -79,16 +84,6 @@ bool phase6_init(void);
 // Allocate a leaked kernel buffer of @size bytes via the IOSurface ranges
 // trick (writes are un-lgd-freed by construction) -- returns kernel VA, 0 if failed.
 uint64_t ps6_kalloc(uint64_t size);
-
-// Free-form kernel R/W wrappers used by phase6 (provided by main.m / DarkSword)
-extern void kwrite64(uint64_t addr, uint64_t val);
-extern void kwrite32(uint64_t addr, uint32_t val);
-extern void kwrite_buf(uint64_t addr, const void *buf, size_t size);
-extern uint64_t kread64(uint64_t addr);
-extern uint32_t kread32(uint64_t addr);
-extern void kread_buf(uint64_t addr, void *buf, size_t size);
-extern uint64_t kread_ptr(uint64_t addr);  // kread64 + xpaci
-extern uint64_t xpaci(uint64_t v);
 
 // Large kernel buffer copy helper used for dumping mappings. Provided
 // locally; just a loop over 8-byte reads.

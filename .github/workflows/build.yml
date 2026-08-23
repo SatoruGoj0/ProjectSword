@@ -44,18 +44,40 @@ jobs:
             --retry 3 --retry-delay 5 || echo "[-] Sileo download failed (build continues)"
           ls -lh sileo.deb 2>/dev/null || echo "[-] No sileo.deb"
 
-      - name: Extract sileo.tar from deb (on-device dpkg/xz impossible without trust cache)
+      - name: Ad-hoc sign bootstrap + Sileo (Mach-O) so trust cache build has cdhashes
         run: |
+          set -e
+          sign_tree() {
+            dir="$1"; tarout="$2"; signed=0
+            echo "[*] Scanning $dir for Mach-O to sign..."
+            while IFS= read -r -d '' f; do
+              if file -b "$f" | grep -qi 'mach-o'; then
+                if ldid -S "$f" 2>/dev/null; then
+                  signed=$((signed+1))
+                else
+                  echo "  [!] ldid failed on $f"
+                fi
+              fi
+            done < <(find "$dir" -type f -print0)
+            echo "[+] Signed $signed binaries in $dir"
+            tar -cf "$tarout" -C "$dir" .
+            echo "[+] Repacked $tarout ($(ls -lh "$tarout" | awk '{print $5}'))"
+          }
+
+          rm -rf bs_tree sl_tree
+          mkdir -p bs_tree sl_tree
+          tar -xf bootstrap.tar -C bs_tree
+          sign_tree bs_tree bootstrap.tar
+
           if [ -f sileo.deb ]; then
-            mkdir -p sileo-extract && cd sileo-extract
-            ar x ../sileo.deb || echo "[-] ar failed"
-            if [ -f data.tar.xz ]; then
-              tar -xJf data.tar.xz || echo "[-] tar extract failed"
-              tar -cf ../sileo.tar . && echo "[+] sileo.tar created ($(ls -lh ../sileo.tar | awk '{print $5}'))"
+            rm -rf sx && mkdir -p sx && (cd sx && ar x ../sileo.deb)
+            if [ -f sx/data.tar.xz ]; then
+              tar -xJf sx/data.tar.xz -C sl_tree
+              sign_tree sl_tree sileo.tar
             else
               echo "[-] data.tar.xz not found in sileo.deb"
             fi
-            cd .. && rm -rf sileo-extract
+            rm -rf sx
           fi
 
       - name: Build TrustCache from bootstrap + Sileo cdhashes
