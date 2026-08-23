@@ -308,11 +308,12 @@ typedef struct {
     uint32_t spare2;
 } PS6_CS_CodeDirectory;
 
-#define PS6_CSMAGIC_EMBEDDED_SIGNATURE 0xfade0c02u
-#define PS6_CSMAGIC_CODEDIRECTORY      0xfade0b01u
+#define PS6_CSMAGIC_EMBEDDED_SIGNATURE 0xfade0cc0u
+#define PS6_CSMAGIC_CODEDIRECTORY      0xfade0c02u
 #define PS6_CSSLOT_CODEDIRECTORY       0u
 
-static inline uint32_t be32(uint32_t v) { return (uint32_t)be32toh(v); }
+// be32toh is not available on iOS SDK headers; byteswap manually (arm64 is LE).
+static inline uint32_t be32(uint32_t v) { return __builtin_bswap32(v); }
 
 static bool ps6_cdhash_from_cd(const uint8_t *cs, uint32_t cs_size,
                                uint8_t out[20], uint8_t *out_type) {

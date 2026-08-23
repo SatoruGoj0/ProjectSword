@@ -32,8 +32,10 @@ MH_MAGIC_64 = 0xFEEDFACF
 LC_CODE_SIGNATURE = 0x1D
 CPU_TYPE_ARM64 = 0x0100000C
 
-CSMAGIC_EMBEDDED_SIGNATURE = 0xFADE0C02
-CSMAGIC_CODEDIRECTORY = 0xFADE0B01
+CSMAGIC_EMBEDDED_SIGNATURE = 0xFADE0CC0
+CSMAGIC_CODEDIRECTORY = 0xFADE0C02
+CSSLOT_CODEDIRECTORY = 0
+CSSLOT_ALTERNATE_CODEDIRECTORY = 0x1000
 
 
 def be32(b):
@@ -55,7 +57,9 @@ def pick_cd(blob: bytes, off: int, size: int):
         base = off + 12
         for i in range(cnt):
             btype, boff = struct.unpack(">II", blob[base + i * 8:base + i * 8 + 8])
-            if btype != CSMAGIC_CODEDIRECTORY:
+            if btype != CSSLOT_CODEDIRECTORY and not (
+                CSSLOT_ALTERNATE_CODEDIRECTORY <= btype < CSSLOT_ALTERNATE_CODEDIRECTORY + 6
+            ):
                 continue
             pos = off + boff
             if pos + 8 > off + size:
