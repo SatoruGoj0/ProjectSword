@@ -28,3 +28,5 @@ DerivedData/
 # macOS
 .DS_Store
 *.dSYM
+__pycache__/
+*.pyc
