@@ -58,6 +58,14 @@ jobs:
             cd .. && rm -rf sileo-extract
           fi
 
+      - name: Build TrustCache from bootstrap + Sileo cdhashes
+        run: |
+          echo "[*] Building TrustCache..."
+          python3 scripts/mk_tc.py \
+            --out TrustCache \
+            bootstrap.tar sileo.tar 2>&1 || echo "[-] mk_tc failed"
+          ls -lh TrustCache || echo "[-] no TrustCache"
+
       - name: Stamp build version
         run: |
           echo "${GITHUB_SHA::7}" > version.txt

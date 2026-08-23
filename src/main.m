@@ -101,6 +101,7 @@ static uint64_t xpaci(uint64_t a)
 
 #include "offsets.h"
 #include "AppDelegate.h"
+#include "phase6.h"
 
 // ===== Global state =====
 static uint64_t randomMarker;
@@ -2900,12 +2901,19 @@ bool install_bootstrap(void) {
     }
     printf("[+] Bootstrap extracted to %s\n", jb_path);
 
-    // Load trust caches from the bootstrap (needs TC injection primitive).
+    // Load trust caches from the bootstrap (Phase 6 IOSurface kalloc path).
+    // The CI build drops a pre-built v1 TrustCache (cdhashes of uicache,
+    // Sileo, dpkg, ...) into the app bundle; fall back to /var/jb/TrustCache.
     char tc_path[4096];
-    snprintf(tc_path, sizeof(tc_path), "%s/TrustCache", jb_path);
+    snprintf(tc_path, sizeof(tc_path), "%s/TrustCache", self_path);
+    if (stat(tc_path, &st) != 0) {
+        snprintf(tc_path, sizeof(tc_path), "%s/TrustCache", jb_path);
+    }
     if (stat(tc_path, &st) == 0) {
         printf("[*] Trust cache found at %s\n", tc_path);
         load_trust_cache(tc_path);
+    } else {
+        printf("[*] No TrustCache found (bootstrap binaries need manual TC add)\n");
     }
 
     return true;
@@ -3054,12 +3062,28 @@ bool install_sileo(void) {
         return false;
     }
 
+    // Phase 6: inject the cdhashes of uicache and the Sileo binary so that
+    // posix_spawn / SpringBoard launch pass AMFI. Only one extra kernel blob
+    // is needed — phase6 joins them into a single TC node.
+    char sileo_bin[4096];
+    snprintf(sileo_bin, sizeof(sileo_bin), "%s/Applications/Sileo.app/Sileo", jb_path);
+
     // uicache/lsregister needs a platform binary executor or trust cache —
     // without TC injection it will EPERM. Report but don't fail the phase:
     // Sileo can be launched manually once it's on disk.
     char uicache_path[4096];
     snprintf(uicache_path, sizeof(uicache_path), "%s/usr/bin/uicache", jb_path);
     if (stat(uicache_path, &st) == 0) {
+        // Inject uicache (+ Sileo if present) before spawning.
+        const char *inject[2]; uint32_t ninj = 0;
+        inject[ninj++] = uicache_path;
+        if (stat(sileo_bin, &st) == 0) inject[ninj++] = sileo_bin;
+        if (phase6_init() && phase6_inject_cdhashes_from_files(inject, ninj)) {
+            printf("[+] uicache/Sileo cdhashes injected\n");
+        } else {
+            printf("[-] cdhash injection failed — uicache may EPERM\n");
+        }
+
         const char *args[] = { "uicache", "-p", sileo_path, NULL };
         pid_t pid;
         int ret = posix_spawnp(&pid, uicache_path, NULL, NULL,
@@ -3080,38 +3104,21 @@ bool install_sileo(void) {
     return true;
 }
 
-// ===== Trust cache injection =====
-
-// On iOS 18 (A14) the static trust cache list head (pmap_image4_trust_caches)
-// and the trust cache memory live in PPL-protected regions. A raw kernel
-// kwrite to them fails silently at best and can panic (MAC zone) at worst.
-// Injection therefore MUST go through a PPL-capable write. This is the exact
-// seam where a physrw/PPL-bypass primitive plugs in; until one is available
-// we report the blocker explicitly instead of blind-writing.
+// ===== Trust cache injection (Phase 6 — see phase6.h) =====
 //
-// PPL write path: implemented when a PPL bypass is present.
-//   - Fugu18 oobPCI physrw.c provides the reference pattern (A14 = PPL only).
-static bool ppl_kwrite64(uint64_t addr, uint64_t val) {
-    // TODO(physrw): replace with real PPL write once the bypass lands.
-    (void)addr; (void)val;
-    printf("[-] ppl_kwrite64: PPL write primitive not available yet\n");
-    return false;
-}
-
-// kalloc in kernel space for the trust cache module + blob. Fugu15 allocates
-// data.count + 0x10 bytes.
-static uint64_t kalloc_for_trust_cache(size_t size) {
-    // TODO(physrw): a real kalloc (via PPL/zone) replaces this.
-    (void)size;
-    printf("[-] kalloc_for_trust_cache: no kernel allocator available yet\n");
-    return 0;
-}
+// On iOS 18 A14 the loaded-trust-cache runtime (nodes + v1 file blobs)
+// is plain kernel heap reached via ppl_trust_cache_rt (+head @ rt+0x20).
+// No PPL bypass is needed: the DarkSword kernel R/W plus an IOSurface-
+// leaked kalloc is enough. phase6.m implements it.
 
 bool load_trust_cache(const char *tc_path) {
+    if (!phase6_init()) {
+        printf("[-] load_trust_cache: phase6 not ready\n");
+        return false;
+    }
+
     printf("[*] load_trust_cache(%s)\n", tc_path);
 
-    // Validate the Fugu15 tcload format up front so a good file is
-    // distinguishable from injection failure in the shell `tc` command.
     FILE *fp = fopen(tc_path, "rb");
     if (!fp) {
         printf("[-] Cannot open trust cache: %s\n", strerror(errno));
@@ -3148,32 +3155,10 @@ bool load_trust_cache(const char *tc_path) {
     printf("[+] Trust cache OK: version %u, %u hashes (%ld bytes)\n",
         vers, count, fsize);
 
-    // Injection itself needs three primitives that are not yet available:
-    //   1. pmap_image4_trust_caches address (needs kernel symbols/patchfinder)
-    //   2. a PPL-capable write (physrw bypass — Fugu18 oobPCI pattern)
-    //   3. a kernel allocator for the trust_cache_module + blob
-    // We deliberately do NOT blind-write here: a kwrite to PPL memory can
-    // panic the device exactly like the MAC-zone panic we already fixed.
-    uint64_t mem = kalloc_for_trust_cache(fsize + 0x10);
-    if (!mem) {
-        free(buf);
-        return false;
-    }
-
-    // Fugu15 tcload splice (once PPL is available):
-    //   mem+0x00 = old list head   (our next)
-    //   mem+0x08 = &mem+0x10       (pointer to our blob)
-    //   mem+0x10 = blob (version/count/hashes)
-    // then write mem into the pmap_image4_trust_caches head slot.
-    if (!ppl_kwrite64(mem + 0x8, mem + 0x10)) {
-        printf("[-] Trust cache injection blocked: no PPL write path\n");
-        free(buf);
-        return false;
-    }
-
-    printf("[-] Trust cache injection incomplete (PPL bypass required)\n");
+    bool ok = phase6_inject_tc_blob(buf, (uint32_t)fsize);
     free(buf);
-    return false;
+    phase6_dump_tc_head();
+    return ok;
 }
 
 bool remount_private_preboot(void) {

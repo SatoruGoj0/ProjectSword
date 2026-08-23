@@ -25,7 +25,7 @@ CFLAGS = $(LINK_FRAMEWORKS) \
          -fobjc-arc
 
 # Only the files we actually need
-OBJECTS = src/main.o src/AppDelegate.o src/shell.o
+OBJECTS = src/main.o src/AppDelegate.o src/shell.o src/phase6.o
 
 all: $(TARGET)
 
@@ -39,6 +39,9 @@ src/AppDelegate.o: src/AppDelegate.m src/AppDelegate.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 src/main.o: src/main.m src/offsets.h src/shell.h src/AppDelegate.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+src/phase6.o: src/phase6.m src/phase6.h src/offsets.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 src/shell.o: src/shell.c src/shell.h src/offsets.h src/jailbreak.h
@@ -56,6 +59,7 @@ ipa: $(TARGET)
 	cp $(ENTITLEMENTS_FILE) Payload/ProjectSword.app/
 	if [ -f version.txt ]; then cp version.txt Payload/ProjectSword.app/; fi
 	if [ -f bootstrap.tar ]; then cp bootstrap.tar Payload/ProjectSword.app/; fi
+	if [ -f TrustCache ]; then cp TrustCache Payload/ProjectSword.app/; fi
 	if [ -f sileo.deb ]; then cp sileo.deb Payload/ProjectSword.app/; fi
 	if [ -f sileo.tar ]; then cp sileo.tar Payload/ProjectSword.app/; fi
 ifneq ($(SIGN),0)
